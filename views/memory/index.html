@@ -446,6 +446,7 @@
 
 <div class="toast" id="toast"></div>
 
+<script src="/api/plugin/page/bridge-sdk.js"></script>
 <script>
 (function () {
   "use strict";
@@ -477,22 +478,41 @@
     }, 2600);
   }
 
-  async function api(path, opts) {
-    var res = await fetch(API + path, Object.assign({
-      credentials: "include",
-      headers: { "Content-Type": "application/json" }
-    }, opts || {}));
+  var bridge = window.AstrBotPluginView || window.AstrBotPluginPage || null;
+  var ACT = "mem-api/";
+
+  function unwrap(res) {
+    if (res && typeof res === "object" && Object.prototype.hasOwnProperty.call(res, "data")) {
+      if (res.status && res.status !== "ok") throw new Error(res.message || "接口返回失败");
+      return res.data;
+    }
+    return res;
+  }
+
+  async function api(action, opts) {
+    opts = opts || {};
+    var params = opts.params || {};
+    if (bridge && typeof bridge.apiGet === "function") {
+      try {
+        var res = opts.body
+          ? await bridge.apiPost(action, opts.body)
+          : await bridge.apiGet(action, params);
+        return unwrap(res);
+      } catch (e) {
+        throw new Error(e && e.message ? e.message : "bridge 调用失败");
+      }
+    }
+    // 退化：脱离 iframe 单独打开文件时走原生 fetch
+    var qs = Object.keys(params).filter(function (k) { return params[k] !== "" && params[k] != null; })
+      .map(function (k) { return encodeURIComponent(k) + "=" + encodeURIComponent(params[k]); }).join("&");
+    var url = API + "/" + action + (qs ? "?" + qs : "");
+    var init = { credentials: "include", headers: { "Content-Type": "application/json" } };
+    if (opts.body) { init.method = "POST"; init.body = JSON.stringify(opts.body); }
+    var r = await fetch(url, init);
     var body = null;
-    try { body = await res.json(); } catch (e) {
-      throw new Error("接口返回不是 JSON（HTTP " + res.status + "）");
-    }
-    if (!res.ok) {
-      throw new Error((body && body.message) || ("HTTP " + res.status));
-    }
-    if (body && body.status && body.status !== "ok") {
-      throw new Error(body.message || "接口返回失败");
-    }
-    return body && Object.prototype.hasOwnProperty.call(body, "data") ? body.data : body;
+    try { body = await r.json(); } catch (e) { throw new Error("接口返回不是 JSON（HTTP " + r.status + "）"); }
+    if (!r.ok) throw new Error((body && body.message) || ("HTTP " + r.status));
+    return unwrap(body);
   }
 
   function relTime(iso) {
@@ -536,7 +556,7 @@
   async function maintenance(kind) {
     var dry = $("dry-run").checked;
     try {
-      var d = await api("/" + kind, { method: "POST", body: JSON.stringify({ dry_run: dry }) });
+      var d = await api(ACT + kind, { body: { dry_run: dry } });
       var msg = (d && (d.message || d.summary)) || "完成";
       toast((dry ? "[dry] " : "") + kind + "：" + msg);
       if (!dry) { loadList(); loadStats(); }
@@ -546,7 +566,7 @@
   /* ── 概览 ─────────────────────────────── */
   async function loadStats() {
     try {
-      var d = await api("/stats");
+      var d = await api(ACT + "stats");
       $("mTotal").textContent = d.total == null ? "—" : d.total;
       $("mActive").textContent = d.active == null ? "—" : d.active;
       $("mHistory").textContent = d.history == null ? "—" : d.history;
@@ -643,9 +663,8 @@
     state.loading = true;
     skeleton();
     try {
-      var qs = "?limit=" + state.limit + "&offset=" + state.offset +
-        "&q=" + encodeURIComponent(state.q) + "&type=" + encodeURIComponent(state.type);
-      var d = await api("/list" + qs);
+      var d = await api(ACT + "list", { params: {
+        limit: state.limit, offset: state.offset, q: state.q, type: state.type } });
       hideError();
       state.items = d.items || [];
       state.total = d.total || 0;
@@ -701,7 +720,7 @@
   async function voidMemory(id) {
     if (!window.confirm("作废 #" + id + " ？\n作废只是把它从检索里摘掉，数据仍保留在库中。")) return;
     try {
-      await api("/forget", { method: "POST", body: JSON.stringify({ id: Number(id) }) });
+      await api(ACT + "forget", { body: { id: Number(id) } });
       toast("已作废 #" + id);
       closeDrawers();
       loadList();
@@ -714,7 +733,7 @@
 
   async function loadGraph() {
     try {
-      var d = await api("/graph");
+      var d = await api(ACT + "graph");
       graphData = d;
       drawGraph();
       var n = (d.nodes || []).length;
@@ -816,10 +835,8 @@
     var btn = $("aSave");
     btn.disabled = true; btn.textContent = "保存中…";
     try {
-      await api("/add", {
-        method: "POST",
-        body: JSON.stringify({ subject: subject, predicate: predicate, value: value, mtype: $("aType").value })
-      });
+      await api(ACT + "add", { body: {
+        subject: subject, predicate: predicate, value: value, mtype: $("aType").value } });
       toast("已写入");
       $("aSubject").value = ""; $("aPredicate").value = ""; $("aValue").value = "";
       closeDrawers();

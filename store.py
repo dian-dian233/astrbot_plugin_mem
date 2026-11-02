@@ -2,11 +2,17 @@
 
 设计：纯标准库，**不 import astrbot**，可以脱离框架单独跑（selftest.py 就是这么测的）。
 
-表结构（mem 表对齐 dd-home/mem/mem.py）：
+表结构（mem 表对齐 dd-home/mem/mem.py，v0.3.0 加生命周期列）：
 
     mem(id, scope, subject, predicate, value, confidence, source,
-        created_at, updated_at, valid_from, valid_to, superseded_by)
+        created_at, updated_at, valid_from, valid_to, superseded_by,
+        mtype, importance, ttl_days, decay_type, last_accessed_at, access_count)
     vec(mem_id, model, dim, vec BLOB, text_hash)
+    meta(key, value)          -- 衰减回合上次执行时间等
+
+v0.3.0 的六个生命周期列**全部有默认值**，老库启动时由 `_ensure_columns()` 逐列
+`ALTER TABLE ... ADD COLUMN` 补上：v0.2 及更早的数据会拿到 mtype=fact、
+ttl_days=3650、importance=0.5、access_count=0，行为等价于「不过期」。
 
 同槽覆盖：同一 (scope, subject, predicate) 只保留一条 `valid_to IS NULL` 的记录。
 写新值时先插新行，再把旧行填上 `valid_to` + `superseded_by`（指向新 id），
@@ -31,6 +37,17 @@ import sqlite3
 import tempfile
 from datetime import datetime, timezone
 
+from .lifecycle import (
+    DECAY_TYPES,
+    DEFAULT_ACCESS_HALVE,
+    DEFAULT_DECAY_TYPE,
+    DEFAULT_IMPORTANCE,
+    DEFAULT_PROTECTED_IMPORTANCE,
+    DEFAULT_TTL_DAYS,
+    clamp,
+    normalize_mtype,
+)
+
 DEFAULT_DB_NAME = "mem.db"
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -47,7 +64,13 @@ CREATE TABLE IF NOT EXISTS mem(
   updated_at TEXT NOT NULL,
   valid_from TEXT NOT NULL,
   valid_to TEXT,
-  superseded_by INTEGER
+  superseded_by INTEGER,
+  mtype TEXT NOT NULL DEFAULT 'fact',
+  importance REAL NOT NULL DEFAULT 0.5,
+  ttl_days REAL NOT NULL DEFAULT 3650,
+  decay_type TEXT NOT NULL DEFAULT 'exp',
+  last_accessed_at TEXT,
+  access_count INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS ix_mem_slot ON mem(scope, subject, predicate, valid_to);
 CREATE INDEX IF NOT EXISTS ix_mem_subject ON mem(subject);
@@ -60,16 +83,46 @@ CREATE TABLE IF NOT EXISTS vec(
   text_hash TEXT NOT NULL DEFAULT '',
   PRIMARY KEY(mem_id, model)
 );
+
+CREATE TABLE IF NOT EXISTS meta(
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 """
+
+# v0.3.0 生命周期列：老库缺哪列补哪列（ALTER TABLE 带 DEFAULT，已有行自动填默认值）
+SCHEMA_COLUMNS = {
+    "mtype": "TEXT NOT NULL DEFAULT 'fact'",
+    "importance": "REAL NOT NULL DEFAULT 0.5",
+    "ttl_days": "REAL NOT NULL DEFAULT 3650",
+    "decay_type": "TEXT NOT NULL DEFAULT 'exp'",
+    "last_accessed_at": "TEXT",
+    "access_count": "INTEGER NOT NULL DEFAULT 0",
+}
+
+
+def _ensure_columns(conn) -> list[str]:
+    """给老库补生命周期列，返回本次新增的列名（新库返回空列表）。"""
+    have = {row["name"] for row in conn.execute("PRAGMA table_info(mem)")}
+    added: list[str] = []
+    for name, ddl in SCHEMA_COLUMNS.items():
+        if name not in have:
+            conn.execute(f"ALTER TABLE mem ADD COLUMN {name} {ddl}")
+            added.append(name)
+    return added
 
 
 class StoreError(Exception):
     """记忆库打不开 / 读不了 / 写不进。上层统一回「记忆库读不了」，不抛 traceback。"""
 
 
-def now_iso() -> str:
-    """本地时区、精确到秒的 ISO 时间串（和 dd-home/mem/mem.py 一致）。"""
-    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+def now_iso(when: datetime | None = None) -> str:
+    """本地时区、精确到秒的 ISO 时间串（和 dd-home/mem/mem.py 一致）。
+
+    `when` 只在测试 / 回填时注入假时钟；日常调用留空。
+    """
+    moment = when or datetime.now(timezone.utc).astimezone()
+    return moment.isoformat(timespec="seconds")
 
 
 # ── 路径解析 ───────────────────────────────────────────────────────────
@@ -211,16 +264,24 @@ def _newer(left: str, right: str) -> bool:
 class Store:
     """记忆库。所有方法同步、线程安全（每次现开连接）。"""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, *, warn=None):
         self.path = path
+        self.migrated_columns: list[str] = []
         try:
             parent = os.path.dirname(os.path.abspath(path))
             if parent:
                 os.makedirs(parent, exist_ok=True)
             with self._conn() as conn:
                 conn.executescript(SCHEMA)
+                self.migrated_columns = _ensure_columns(conn)
         except (sqlite3.Error, OSError) as e:
             raise StoreError(f"打开 {path} 失败：{e}") from e
+        if self.migrated_columns:
+            _warn(
+                warn,
+                f"[mem] 老库迁移：mem 表补上 {', '.join(self.migrated_columns)} "
+                "（默认 mtype=fact / ttl=3650 天，历史数据不会过期）",
+            )
 
     @contextlib.contextmanager
     def _conn(self):
@@ -245,13 +306,36 @@ class Store:
         source: str = "chat",
         confidence: float = 0.8,
         supersede_ids: list[int] | None = None,
+        mtype: str | None = None,
+        importance: float | None = None,
+        ttl_days: float | None = None,
+        decay_type: str | None = None,
+        created_at: str | None = None,
     ) -> dict:
         """写一条事实。同槽旧记录自动作废（填 valid_to + superseded_by）。
 
         supersede_ids：上层（写入相似去重）判定「同一件事」的其它记录，一并作废。
         和同槽覆盖走同一条落库路径，保证 superseded_by 都指向本次新 id。
+
+        mtype / importance / ttl_days / decay_type 留空就按类型默认值补：
+        plan 2 天 step、event 30 天 exp、preference 365 天 exp、fact 3650 天 exp。
         """
-        ts = now_iso()
+        name = normalize_mtype(mtype)
+        try:
+            importance_value = clamp(
+                DEFAULT_IMPORTANCE if importance is None else importance
+            )
+        except (TypeError, ValueError):
+            importance_value = DEFAULT_IMPORTANCE
+        try:
+            ttl = float(DEFAULT_TTL_DAYS[name] if ttl_days is None else ttl_days)
+        except (TypeError, ValueError):
+            ttl = float(DEFAULT_TTL_DAYS[name])
+        decay = str(decay_type or DEFAULT_DECAY_TYPE[name]).strip().lower()
+        if decay not in DECAY_TYPES:
+            decay = DEFAULT_DECAY_TYPE[name]
+
+        ts = now_iso() if created_at is None else str(created_at)
         with self._conn() as conn:
             old = conn.execute(
                 "SELECT id FROM mem WHERE scope=? AND subject=? AND predicate=? AND valid_to IS NULL",
@@ -259,8 +343,13 @@ class Store:
             ).fetchall()
             cur = conn.execute(
                 "INSERT INTO mem(scope,subject,predicate,value,confidence,source,"
-                "created_at,updated_at,valid_from) VALUES(?,?,?,?,?,?,?,?,?)",
-                (scope, subject, predicate, value, confidence, source, ts, ts, ts),
+                "created_at,updated_at,valid_from,mtype,importance,ttl_days,decay_type,"
+                "last_accessed_at,access_count) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
+                (
+                    scope, subject, predicate, value, confidence, source,
+                    ts, ts, ts, name, importance_value, ttl, decay, ts,
+                ),
             )
             new_id = int(cur.lastrowid)
             superseded = [int(r["id"]) for r in old]
@@ -302,6 +391,149 @@ class Store:
                     (ts, ts, r["id"]),
                 )
         return [_row_to_dict(r) for r in rows]
+
+    # ── 生命周期：访问强化 / 衰减回合 / 合并 ──────────────────────────
+
+    @_db_guard
+    def reinforce(self, ids: list[int], *, now: datetime | None = None) -> int:
+        """检索命中后加固：access_count += 1、last_accessed_at = now。
+
+        只加固有效记录（valid_to IS NULL）。返回实际加固条数。
+        """
+        clean: list[int] = []
+        for item in ids or []:
+            try:
+                clean.append(int(item))
+            except (TypeError, ValueError):
+                continue
+        if not clean:
+            return 0
+        ts = now_iso(now)
+        marks = ",".join("?" * len(clean))
+        with self._conn() as conn:
+            cur = conn.execute(
+                f"UPDATE mem SET access_count = access_count + 1, last_accessed_at=? "
+                f"WHERE id IN ({marks}) AND valid_to IS NULL",
+                [ts, *clean],
+            )
+            return int(cur.rowcount or 0)
+
+    @_db_guard
+    def apply_decay_pass(
+        self,
+        *,
+        access_halve: float = DEFAULT_ACCESS_HALVE,
+        protected_importance: float = DEFAULT_PROTECTED_IMPORTANCE,
+        now: datetime | None = None,
+        force: bool = False,
+        min_interval: float = 3600.0,
+    ) -> dict:
+        """衰减回合：所有非保护记录的 access_count 按 access_halve 回落。
+
+        防止「十年前的热点」靠历史访问次数永远霸榜。默认每小时最多跑一次
+        （时间戳存 meta 表），`force=True` 用于单测。
+        """
+        moment = now or datetime.now(timezone.utc).astimezone()
+        stamp = moment.timestamp()
+        try:
+            halve = clamp(access_halve, 0.0, 1.0)
+        except (TypeError, ValueError):
+            halve = DEFAULT_ACCESS_HALVE
+        with self._conn() as conn:
+            last_row = conn.execute(
+                "SELECT value FROM meta WHERE key='decay_last_run'"
+            ).fetchone()
+            try:
+                last = float(last_row["value"]) if last_row else 0.0
+            except (TypeError, ValueError):
+                last = 0.0
+            if not force and last and stamp - last < float(min_interval):
+                return {"skipped": True, "scanned": 0, "updated": 0, "last_run": last}
+            rows = conn.execute(
+                "SELECT id, importance, access_count FROM mem WHERE valid_to IS NULL"
+            ).fetchall()
+            updated = 0
+            for row in rows:
+                try:
+                    if float(row["importance"] or 0) >= float(protected_importance):
+                        continue  # 保护记录不衰减
+                except (TypeError, ValueError):
+                    pass
+                count = int(row["access_count"] or 0)
+                if count <= 0:
+                    continue
+                new_count = max(0, int(count * halve))
+                if new_count != count:
+                    conn.execute(
+                        "UPDATE mem SET access_count=? WHERE id=?", (new_count, int(row["id"]))
+                    )
+                    updated += 1
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES('decay_last_run', ?)",
+                (str(stamp),),
+            )
+        return {"skipped": False, "scanned": len(rows), "updated": updated, "last_run": stamp}
+
+    @_db_guard
+    def merge_rows(
+        self,
+        keep_id: int,
+        drop_ids: list[int],
+        *,
+        importance: float | None = None,
+        access_count: int | None = None,
+        now: datetime | None = None,
+    ) -> dict:
+        """consolidate 落库：保留行更新 importance / access_count，其余行填 valid_to。"""
+        ts = now_iso(now)
+        keep = int(keep_id)
+        drop = []
+        for item in drop_ids or []:
+            try:
+                value = int(item)
+            except (TypeError, ValueError):
+                continue
+            if value != keep:
+                drop.append(value)
+        with self._conn() as conn:
+            sets = ["updated_at=?"]
+            params: list = [ts]
+            if importance is not None:
+                sets.append("importance=?")
+                params.append(clamp(importance))
+            if access_count is not None:
+                sets.append("access_count=?")
+                params.append(max(0, int(access_count)))
+            conn.execute(f"UPDATE mem SET {', '.join(sets)} WHERE id=?", [*params, keep])
+            for drop_id in drop:
+                conn.execute(
+                    "UPDATE mem SET valid_to=?, superseded_by=?, updated_at=? "
+                    "WHERE id=? AND valid_to IS NULL",
+                    (ts, keep, ts, drop_id),
+                )
+        return {"keep": keep, "dropped": drop, "at": ts}
+
+    @_db_guard
+    def type_counts(self) -> dict:
+        """有效记录按 mtype 计数（stats 用）。"""
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT mtype, COUNT(*) n FROM mem WHERE valid_to IS NULL GROUP BY mtype"
+            ).fetchall()
+        return {str(r["mtype"] or "fact"): int(r["n"]) for r in rows}
+
+    @_db_guard
+    def meta_get(self, key: str, default: str = "") -> str:
+        with self._conn() as conn:
+            row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return str(row["value"]) if row else default
+
+    @_db_guard
+    def meta_set(self, key: str, value: str) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?,?)", (str(key), str(value))
+            )
 
     # ── 读 ────────────────────────────────────────────────────────────
 
@@ -441,6 +673,7 @@ class Store:
             "active": int(active),
             "history": int(history),
             "scopes": scopes,
+            "types": self.type_counts(),
             "last_updated": last or "",
             "vec_rows": int(vec_rows),
             "path": self.path,
@@ -541,6 +774,22 @@ class Store:
             confidence = float(raw.get("confidence", 0.8))
         except (TypeError, ValueError):
             confidence = 0.8
+        mtype = normalize_mtype(raw.get("mtype"))
+        try:
+            importance = clamp(raw.get("importance", DEFAULT_IMPORTANCE))
+        except (TypeError, ValueError):
+            importance = DEFAULT_IMPORTANCE
+        try:
+            ttl_days = float(raw.get("ttl_days", DEFAULT_TTL_DAYS[mtype]))
+        except (TypeError, ValueError):
+            ttl_days = float(DEFAULT_TTL_DAYS[mtype])
+        decay_type = str(raw.get("decay_type") or DEFAULT_DECAY_TYPE[mtype]).strip().lower()
+        if decay_type not in DECAY_TYPES:
+            decay_type = DEFAULT_DECAY_TYPE[mtype]
+        try:
+            access_count = max(0, int(raw.get("access_count", 0)))
+        except (TypeError, ValueError):
+            access_count = 0
         return {
             "scope": scope,
             "subject": subject,
@@ -552,21 +801,36 @@ class Store:
             "updated_at": updated_at,
             "valid_from": str(raw.get("valid_from") or updated_at),
             "valid_to": raw.get("valid_to"),
+            "mtype": mtype,
+            "importance": importance,
+            "ttl_days": ttl_days,
+            "decay_type": decay_type,
+            "last_accessed_at": raw.get("last_accessed_at"),
+            "access_count": access_count,
         }
 
     @_db_guard
     def _merge_one(self, rec: dict) -> str:
+        columns = (
+            "scope", "subject", "predicate", "value", "confidence", "source",
+            "created_at", "updated_at", "valid_from", "mtype", "importance",
+            "ttl_days", "decay_type", "last_accessed_at", "access_count",
+        )
+        base_values = [rec[name] for name in columns]
+
+        def insert(conn, valid_to=None, superseded_by=None) -> int:
+            all_columns = list(columns) + ["valid_to", "superseded_by"]
+            cols = ",".join(all_columns)
+            marks = ",".join("?" * len(all_columns))
+            cur = conn.execute(
+                f"INSERT INTO mem({cols}) VALUES({marks})",
+                [*base_values, valid_to, superseded_by],
+            )
+            return int(cur.lastrowid)
+
         with self._conn() as conn:
             if rec.get("valid_to"):  # 历史记录：直接补进去，不参与覆盖
-                conn.execute(
-                    "INSERT INTO mem(scope,subject,predicate,value,confidence,source,"
-                    "created_at,updated_at,valid_from,valid_to) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                    (
-                        rec["scope"], rec["subject"], rec["predicate"], rec["value"],
-                        rec["confidence"], rec["source"], rec["created_at"],
-                        rec["updated_at"], rec["valid_from"], rec["valid_to"],
-                    ),
-                )
+                insert(conn, rec["valid_to"], rec.get("superseded_by"))
                 return "added"
 
             row = conn.execute(
@@ -574,15 +838,7 @@ class Store:
                 (rec["scope"], rec["subject"], rec["predicate"]),
             ).fetchone()
             if row is None:
-                conn.execute(
-                    "INSERT INTO mem(scope,subject,predicate,value,confidence,source,"
-                    "created_at,updated_at,valid_from) VALUES(?,?,?,?,?,?,?,?,?)",
-                    (
-                        rec["scope"], rec["subject"], rec["predicate"], rec["value"],
-                        rec["confidence"], rec["source"], rec["created_at"],
-                        rec["updated_at"], rec["valid_from"],
-                    ),
-                )
+                insert(conn)
                 return "added"
 
             old = _row_to_dict(row)
@@ -591,17 +847,9 @@ class Store:
             if not _newer(rec["updated_at"], old["updated_at"]):
                 return "skipped"
 
-            cur = conn.execute(
-                "INSERT INTO mem(scope,subject,predicate,value,confidence,source,"
-                "created_at,updated_at,valid_from) VALUES(?,?,?,?,?,?,?,?,?)",
-                (
-                    rec["scope"], rec["subject"], rec["predicate"], rec["value"],
-                    rec["confidence"], rec["source"], rec["created_at"],
-                    rec["updated_at"], rec["valid_from"],
-                ),
-            )
+            new_id = insert(conn)
             conn.execute(
                 "UPDATE mem SET valid_to=?, superseded_by=?, updated_at=? WHERE id=?",
-                (rec["updated_at"], int(cur.lastrowid), rec["updated_at"], old["id"]),
+                (rec["updated_at"], new_id, rec["updated_at"], old["id"]),
             )
             return "updated"

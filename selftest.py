@@ -16,6 +16,20 @@
  10. 模型名变化 → 关键词兜底不崩
  11. embedding 缓存命中（数调用次数）
   + 参数解析单测、export/import 合并、db_path 默认位置
+
+v0.3.0 新增（记忆生命周期 / RRF / consolidate）：
+ 12. plan 过 TTL 后不参与检索（假时钟注入 now）
+ 13. fact 30 天后仍在、但 decay 把分数压低
+ 14. linear / step / exp 三种衰减公式数值
+ 15. access_count 越高 decay 越慢，到 access_cap 封顶
+ 16. 衰减回合后 access_count 按 access_halve 回落
+ 17. importance >= protected_importance 的记录不衰减
+ 18. RRF：两路都命中的分数高于单路命中
+ 19. 某一路为空 → 只用另一路，结果不为空
+ 20. agreement_bonus：两路名次越接近加成越大
+ 21. consolidate：--dry-run 不改库；真跑后条数下降、importance 取 max、access 求和
+ 22. 老库（v0.2 表结构）自动补列，历史数据可读可检索
+ 23. plan 类型识别（线索词 / --type 覆盖）与 TTL 落库
 """
 
 from __future__ import annotations
@@ -28,6 +42,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+from datetime import datetime, timedelta, timezone
 
 sys.dont_write_bytecode = True
 
@@ -321,6 +336,17 @@ class Harness:
             "dedupe_threshold": 0.95,
             "min_score": 0.2,
             "inject_char_cap": 600,
+            # v0.3.0 新增（和 _conf_schema.json 默认值保持一致）
+            "default_mtype": "fact",
+            "ttl_fact": 3650,
+            "ttl_preference": 365,
+            "ttl_event": 30,
+            "ttl_plan": 2,
+            "rrf_k": 60,
+            "agreement_bonus": 0.02,
+            "protected_importance": 0.9,
+            "access_cap": 10,
+            "access_halve": 0.5,
         }
         self.conf.update(conf_overrides)
         self.plugin = main_mod.MemPlugin(self.ctx, self.conf)
@@ -822,6 +848,270 @@ async def test_db_path(main_mod, tmp, chk: Checker) -> None:
     chk.ok("db_path 指插件目录 → 拒绝并改默认", not inside.startswith(os.path.realpath(HERE) + os.sep), inside)
 
 
+# ── v0.3.0：记忆生命周期 / RRF / consolidate ──────────────────────────
+
+
+def _mod(name: str):
+    """按包名取兄弟模块（load_plugin 之后它们已经在 sys.modules 里）。"""
+    return sys.modules[f"{PKG_NAME}.{name}"]
+
+
+async def test_lifecycle_plan_ttl(main_mod, tmp, chk: Checker) -> None:
+    """12. plan 类型 TTL=2 天，过期不参与检索（假时钟注入 now）。"""
+    h = Harness(main_mod, tmp, db_name="life_plan.db", rerank=False)
+    r = await h.cmd("mem add 点点 待办 明天交周报")
+    chk.ok("线索词「明天」→ 判为 plan", "[plan]" in r, r)
+    row = h.store.active_rows()[0]
+    chk.eq(row["mtype"], "plan", "plan 类型落库")
+    chk.eq(float(row["ttl_days"]), 2.0, "plan 默认 TTL 2 天")
+    chk.eq(str(row["decay_type"]), "step", "plan 用 step 衰减")
+
+    now = datetime.now(timezone.utc).astimezone()
+    retriever = h.plugin._build_retriever(h.store)
+    today = await retriever.search("周报", now=now)
+    chk.ok("plan 当天能检索到", bool(today.rows), str(today.rows))
+    later = await retriever.search("周报", now=now + timedelta(days=3))
+    chk.ok("plan 3 天后不再出现在检索结果", not later.rows, str(later.rows))
+    chk.eq(h.store.stats()["active"], 1, "过期不物理删（只是不参与检索）")
+
+
+async def test_lifecycle_fact_decay(main_mod, tmp, chk: Checker) -> None:
+    """13. fact 30 天后仍在，但 decay 把分数压低。"""
+    h = Harness(main_mod, tmp, db_name="life_fact.db", rerank=False)
+    await h.cmd("mem add 服务器 部署在 阿里云")
+    row = h.store.active_rows()[0]
+    chk.eq(row["mtype"], "fact", "默认类型是 fact")
+    chk.eq(float(row["ttl_days"]), 3650.0, "fact 默认 TTL 3650 天")
+    chk.eq(str(row["decay_type"]), "exp", "fact 用 exp 衰减")
+
+    short = Harness(main_mod, tmp, db_name="life_fact30.db", rerank=False, ttl_fact=30)
+    await short.cmd("mem add 服务器 部署在 阿里云")
+    now = datetime.now(timezone.utc).astimezone()
+    got = await short.plugin._build_retriever(short.store).search(
+        "阿里云", now=now + timedelta(days=30)
+    )
+    chk.ok("fact 30 天后仍在（exp 只降权不剔除）", bool(got.rows), str(got.rows))
+    decay = float(got.rows[0]["decay"]) if got.rows else 0.0
+    chk.ok("TTL 30 天、放了 30 天 → decay ≈ 0.25", abs(decay - 0.25) < 0.02, str(decay))
+    chk.ok(
+        "decay 把分数压到 1 以下",
+        bool(got.rows) and float(got.rows[0]["score"]) < 1.0,
+        str(got.rows[:1]),
+    )
+
+
+def test_lifecycle_decay_formulas(main_mod, chk: Checker) -> None:
+    """14. linear / step / exp 三种衰减公式数值。"""
+    lc = _mod("lifecycle")
+    chk.eq(round(lc.decay_factor("linear", 10, 5), 6), 0.5, "linear：过一半 TTL → 0.5")
+    chk.eq(round(lc.decay_factor("linear", 10, 20), 6), 0.0, "linear：过 TTL → 0（不会负数）")
+    chk.eq(lc.decay_factor("step", 2, 2), 1.0, "step：TTL 内 → 1.0")
+    chk.eq(lc.decay_factor("step", 2, 2.5), 0.05, "step：过 TTL → 0.05")
+    chk.eq(round(lc.decay_factor("exp", 10, 5), 6), 0.5, "exp：半衰期 = TTL/2 → 0.5")
+    chk.eq(round(lc.decay_factor("exp", 10, 10), 6), 0.25, "exp：一个 TTL 后 → 0.25")
+
+
+def test_lifecycle_access_boost(main_mod, chk: Checker) -> None:
+    """15. access_count 越高 decay 越慢，到 access_cap 封顶。"""
+    lc = _mod("lifecycle")
+    base = lc.decay_factor("exp", 30, 15)  # 0.5
+    d0 = lc.effective_decay(base, 0, 10)
+    d5 = lc.effective_decay(base, 5, 10)
+    d10 = lc.effective_decay(base, 10, 10)
+    d99 = lc.effective_decay(base, 99, 10)
+    chk.eq(round(d0, 6), 0.5, "没被访问过 → 原衰减")
+    chk.ok(d5 > d0, "access_count 提高 → decay 变慢")
+    chk.eq(round(d5, 6), 0.75, "5/10 次 → 0.5 + 0.5*0.5")
+    chk.eq(round(d10, 6), 1.0, "到 access_cap → 不再衰减")
+    chk.eq(round(d99, 6), 1.0, "超过 access_cap 不再变慢")
+
+
+async def test_lifecycle_access_halve(main_mod, tmp, chk: Checker) -> None:
+    """16. 衰减回合后 access_count 按 access_halve 回落（小时级节流）。"""
+    h = Harness(main_mod, tmp, db_name="life_halve.db", rerank=False)
+    hit = h.store.add("global", "甲机", "状态", "在线")["id"]
+    idle = h.store.add("global", "乙机", "状态", "离线")["id"]
+    with sqlite3.connect(h.store.path) as conn:
+        conn.execute("UPDATE mem SET access_count=8 WHERE id=?", (hit,))
+        conn.execute("UPDATE mem SET access_count=3 WHERE id=?", (idle,))
+
+    skipped = h.store.apply_decay_pass()
+    chk.ok("一小时内重复调用 → 跳过（meta 记时间戳）", bool(skipped["skipped"]), str(skipped))
+
+    report = h.store.apply_decay_pass(force=True)
+    chk.eq(report["updated"], 2, "两条非保护记录都回落")
+    chk.eq(int(h.store.get(hit)["access_count"]), 4, "8 → 4（×0.5）")
+    chk.eq(int(h.store.get(idle)["access_count"]), 1, "3 → 1（整数截断）")
+
+
+def test_lifecycle_protected(main_mod, chk: Checker) -> None:
+    """17. importance >= protected_importance 的记录不衰减。"""
+    lc = _mod("lifecycle")
+    now = datetime.now(timezone.utc).astimezone()
+    row = {
+        "importance": 0.95,
+        "decay_type": "exp",
+        "ttl_days": 10,
+        "created_at": (now - timedelta(days=30)).isoformat(),
+        "access_count": 0,
+    }
+    old_score, old_decay = lc.final_score(1.0, row, now=now)
+    fresh_score, _ = lc.final_score(1.0, dict(row, created_at=now.isoformat()), now=now)
+    chk.eq(old_decay, 1.0, "importance 0.95 → decay 不生效")
+    chk.ok(abs(old_score - fresh_score) < 1e-9, "放 30 天与当天分数完全一致")
+
+    plain_score, plain_decay = lc.final_score(1.0, dict(row, importance=0.5), now=now)
+    chk.ok(plain_decay < 0.1, "同条件 importance 0.5 → 衰减到 0.1 以下")
+    chk.ok(plain_score < old_score, "普通记录分数被压低")
+
+    expired_plan = {
+        "importance": 0.95, "decay_type": "step", "ttl_days": 2,
+        "created_at": (now - timedelta(days=9)).isoformat(),
+    }
+    chk.ok(
+        not lc.is_expired(expired_plan, now=now),
+        "高 importance 的 plan 也不会因过期被剔除",
+    )
+
+def test_rrf_dual_route(main_mod, chk: Checker) -> None:
+    """18. RRF：两路都命中 > 只有单路命中。"""
+    ret = _mod("retrieve")
+    fused = ret.rrf_fuse([1, 2], [1, 3], k=60, agreement_bonus=0.0)
+    chk.ok(fused[1]["score"] > fused[2]["score"], "双路第 1 > 单路（向量）第 2")
+    chk.ok(fused[1]["score"] > fused[3]["score"], "双路第 1 > 单路（关键词）第 2")
+    chk.ok(abs(fused[1]["score"] - 2.0 / 61) < 1e-9, "双路都排第 1 → 1/61 + 1/61")
+    chk.eq(fused[2]["vec_rank"], 1, "向量路名次记录正确")
+    chk.eq(fused[2]["kw_rank"], None, "没走关键词路 → kw_rank 为空")
+
+
+async def test_rrf_empty_route(main_mod, tmp, chk: Checker) -> None:
+    """19. 某一路为空 → 只用另一路，不拿空路稀释。"""
+    ret = _mod("retrieve")
+    solo = ret.rrf_fuse([], [7, 8], k=60, agreement_bonus=0.02)
+    chk.ok(7 in solo and 8 in solo, "关键词单路也能融合出结果")
+    chk.ok(solo[7]["score"] > solo[8]["score"], "单路按名次给分")
+    chk.eq(solo[7]["vec_rank"], None, "空路没有 rank，不贡献也不稀释")
+    chk.ok(abs(solo[7]["score"] - 1.0 / 61) < 1e-9, "空路时分数就是 1/(k+1)")
+    chk.eq(ret.rrf_fuse([], [], k=60), {}, "两路全空 → 空结果")
+
+    h = Harness(main_mod, tmp, db_name="solo_route.db", embed=False, rerank=False)
+    await h.cmd("mem add 点点 喜欢 看星星")
+    r = await h.cmd("mem search 星星")
+    chk.ok("端到端：向量路空 → 关键词路照样出结果", "看星星" in r, r)
+    chk.ok("融合信息标明向量路 0 条", "向量 0" in r, r)
+
+
+def test_rrf_agreement_bonus(main_mod, chk: Checker) -> None:
+    """20. agreement_bonus：两路都中且名次接近 → 分数更高。"""
+    ret = _mod("retrieve")
+    off = ret.rrf_fuse([1, 2, 3], [3, 2, 1], k=60, agreement_bonus=0.0)
+    on = ret.rrf_fuse([1, 2, 3], [3, 2, 1], k=60, agreement_bonus=0.02)
+    chk.ok(on[2]["score"] > off[2]["score"], "名次差距 0 → 拿到加成")
+    chk.ok(on[1]["score"] > off[1]["score"], "名次差距 2 → 也有加成")
+    gap0 = on[2]["score"] - off[2]["score"]
+    gap2 = on[1]["score"] - off[1]["score"]
+    chk.ok(gap0 > gap2, f"名次越接近加成越大（{gap0:.4f} > {gap2:.4f}）")
+    chk.ok(abs(gap0 - 0.02) < 1e-9, "gap=0 时加满 agreement_bonus")
+
+
+async def test_consolidate(main_mod, tmp, chk: Checker) -> None:
+    """21. consolidate：--dry-run 不改库；真跑后合并 + importance max + access 求和。"""
+    emb = VectorEmbedder({
+        "看星星": [1.0, 0.0, 0.0],
+        "看星星和月亮": [0.99, 0.14, 0.0],
+        "看星星呀": [0.98, 0.2, 0.0],
+    })
+    h = Harness(main_mod, tmp, db_name="consolidate.db", embedder=emb, rerank=False)
+    first = h.store.add("global", "点点", "喜欢", "看星星", importance=0.4)["id"]
+    keeper = h.store.add("global", "点点", "爱好", "看星星和月亮", importance=0.8)["id"]
+    third = h.store.add("global", "点点", "偏好", "看星星呀", importance=0.6)["id"]
+    with sqlite3.connect(h.store.path) as conn:
+        for mem_id, count in ((first, 1), (keeper, 2), (third, 3)):
+            conn.execute("UPDATE mem SET access_count=? WHERE id=?", (count, mem_id))
+    chk.eq(h.store.stats()["active"], 3, "先造 3 条同主语相近记录")
+
+    r = await h.cmd("mem consolidate --dry-run")
+    chk.ok("--dry-run 报告「可合并 1 组」", "可合并 1 组" in r, r)
+    chk.ok("--dry-run 明说没改库", "没改库" in r, r)
+    chk.eq(h.store.stats()["active"], 3, "--dry-run 不改库")
+    chk.ok(not h.store.get(first)["valid_to"], "--dry-run 不填 valid_to")
+
+    r = await h.cmd("mem consolidate")
+    chk.ok("真跑：作废 2 条", "已作废 2 条" in r, r)
+    chk.eq(h.store.stats()["active"], 1, "真跑后只剩 1 条有效")
+    kept = h.store.get(keeper)
+    chk.ok(not kept["valid_to"], "保留行没被作废")
+    chk.eq(kept["value"], "看星星和月亮", "保留 value 最完整（最长）的那条")
+    chk.eq(float(kept["importance"]), 0.8, "importance 取组内 max")
+    chk.eq(int(kept["access_count"]), 6, "access_count 求和 1+2+3")
+    chk.ok(bool(h.store.get(first)["valid_to"]), "其余记录填 valid_to")
+    chk.eq(int(h.store.get(first)["superseded_by"]), keeper, "superseded_by 指向保留行")
+
+    r = await h.cmd("mem consolidate")
+    chk.ok("再跑一次 → 可合并 0 组", "可合并 0 组" in r, r)
+
+
+async def test_migration_from_v02(main_mod, tmp, chk: Checker) -> None:
+    """22. 老库（v0.2 六列 schema）启动自动补列，历史数据可读可检索。"""
+    path = os.path.join(tmp, "legacy_v02.db")
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+CREATE TABLE mem(
+  id INTEGER PRIMARY KEY,
+  scope TEXT NOT NULL, subject TEXT NOT NULL, predicate TEXT NOT NULL,
+  value TEXT NOT NULL, confidence REAL DEFAULT 0.8, source TEXT,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  valid_from TEXT NOT NULL, valid_to TEXT, superseded_by INTEGER
+);
+CREATE INDEX ix_mem_slot ON mem(scope, subject, predicate, valid_to);
+CREATE TABLE vec(
+  mem_id INTEGER NOT NULL, model TEXT NOT NULL, dim INTEGER NOT NULL,
+  vec BLOB NOT NULL, text_hash TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY(mem_id, model)
+);
+INSERT INTO mem(scope,subject,predicate,value,created_at,updated_at,valid_from)
+VALUES('global','老服务器','系统','v0.2 留下的数据',
+       '2025-01-01T00:00:00+08:00','2025-01-01T00:00:00+08:00','2025-01-01T00:00:00+08:00');
+"""
+    )
+    conn.commit()
+    conn.close()
+
+    h = Harness(main_mod, tmp, db_path=path, rerank=False)
+    chk.ok("缺的列都被补上", "mtype" in h.store.migrated_columns, str(h.store.migrated_columns))
+    row = h.store.active_rows()[0]
+    chk.eq(row["mtype"], "fact", "老数据默认 fact")
+    chk.eq(float(row["ttl_days"]), 3650.0, "老数据默认 TTL 3650 天")
+    chk.eq(int(row["access_count"]), 0, "老数据 access_count=0")
+    chk.eq(float(row["importance"]), 0.5, "老数据 importance=0.5")
+
+    r = await h.cmd("mem search 老服务器")
+    chk.ok("迁移后老数据照样能检索", "v0.2 留下的数据" in r, r)
+    r = await h.cmd("mem stats")
+    chk.ok("stats 显示类型分布", "类型：" in r and "fact" in r, r)
+
+
+async def test_mtype_resolution(main_mod, tmp, chk: Checker) -> None:
+    """23. plan 识别（线索词 / --type 覆盖）与各类型 TTL 落库。"""
+    h = Harness(main_mod, tmp, db_name="mtype.db", rerank=False)
+    r = await h.cmd("mem add 点点 待办 明天交周报")
+    chk.ok("线索词 → plan", "[plan]" in r, r)
+    r = await h.cmd("mem add 点点 喜欢 看星星")
+    chk.ok("普通陈述 → fact", "[fact]" in r, r)
+    r = await h.cmd("mem add 点点 计划 下周一发版 --type event")
+    chk.ok("--type 覆盖线索词", "[event]" in r, r)
+    r = await h.cmd("mem add 点点 习惯 喝美式 --type preference")
+    chk.ok("--type preference", "[preference]" in r, r)
+
+    by_pred = {row["predicate"]: row for row in h.store.active_rows()}
+    chk.eq(float(by_pred["计划"]["ttl_days"]), 30.0, "event TTL 30 天")
+    chk.eq(float(by_pred["习惯"]["ttl_days"]), 365.0, "preference TTL 365 天")
+    chk.eq(float(by_pred["待办"]["ttl_days"]), 2.0, "plan TTL 2 天")
+    r = await h.cmd("mem add 点点 备注 随便 --type 不认识的类型")
+    chk.ok("未知类型 → 回落默认 fact", "[fact]" in r, r)
+
+
 # ── 入口 ───────────────────────────────────────────────────────────────
 
 
@@ -853,6 +1143,19 @@ async def run_all() -> int:
         await test_dedupe_cmd(main_mod, tmp_root, chk)
         await test_inject_cap(main_mod, tmp_root, chk)
         await test_db_path(main_mod, tmp_root, chk)
+        # v0.3.0：生命周期 / RRF / consolidate / 迁移
+        await test_lifecycle_plan_ttl(main_mod, tmp_root, chk)
+        await test_lifecycle_fact_decay(main_mod, tmp_root, chk)
+        test_lifecycle_decay_formulas(main_mod, chk)
+        test_lifecycle_access_boost(main_mod, chk)
+        await test_lifecycle_access_halve(main_mod, tmp_root, chk)
+        test_lifecycle_protected(main_mod, chk)
+        test_rrf_dual_route(main_mod, chk)
+        await test_rrf_empty_route(main_mod, tmp_root, chk)
+        test_rrf_agreement_bonus(main_mod, chk)
+        await test_consolidate(main_mod, tmp_root, chk)
+        await test_migration_from_v02(main_mod, tmp_root, chk)
+        await test_mtype_resolution(main_mod, tmp_root, chk)
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
 

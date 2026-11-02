@@ -2,12 +2,13 @@
 
 指令（前缀 `/` 或 `!`，唤醒前缀由框架剥掉，这里再兜一层）：
 
-    /mem add <主语> <谓词> <内容> [--scope group:123]
+    /mem add <主语> <谓词> <内容> [--scope group:123] [--type plan] [--importance 0.9]
     /mem search <关键词> [数量]
     /mem list [数量]
     /mem forget <关键词>
     /mem stats
     /mem dedupe [--dry-run]
+    /mem consolidate [--dry-run]
     /mem export [文件路径]
     /mem import <文件路径>
 
@@ -17,6 +18,15 @@ LLM 工具：memory_add / memory_search（`@filter.llm_tool`）。
 120）字、拒叙事体（`reject_narrative`）、同槽覆盖优先于追加、同主语同义（cos ≥
 `dedupe_threshold`）也走覆盖。检索输出按 (subject, predicate) 只留最新一条，噪声地板
 `min_score`。
+
+记忆生命周期（v0.3.0，实现在 lifecycle.py）：每条记录带 mtype / importance / ttl_days /
+decay_type / last_accessed_at / access_count。四种类型 fact(3650d exp) / preference(365d exp) /
+event(30d exp) / plan(2d step)。检索时 `final = base * decay * (0.5 + 0.5*importance)`，
+decay 按年龄算、按 access_count 强化（`access_cap` 封顶），`importance >= protected_importance`
+的记录不衰减；plan 过 TTL 直接不参与检索（不再像 v0.2 那样拒写）。
+
+检索链路（v0.3.0）：向量 top-k + 关键词 BM25 top-k → RRF 融合（`rrf_k`）→ rerank →
+decay 加权 → 截断。某一路为空只用另一路，不拿空路稀释。
 
 注入策略：默认 `auto_inject_n = 0`，**不往 prompt 里塞任何记忆**；配成 N>0 才每轮
 注入 top-N 条、按主语去重、每条截 200 字且总量不超 `inject_char_cap`（默认 600）。
@@ -37,6 +47,8 @@ API 出处（都已 grep 过 AstrBot 4.29.3 源码，不凭记忆）：
     - 事件方法 is_admin / get_sender_id / get_group_id / plain_result：
       astrbot/core/platform/astr_message_event.py:319/254/246/455
     - 配置项 type: float 合法：astrbot/dashboard/services/config_service.py:61
+    - LLM 工具参数由 docstring Args 生成（可选参数靠函数默认值兜底）：
+      astrbot/core/star/register/star_handler.py:586-670
 """
 
 from __future__ import annotations
@@ -59,6 +71,16 @@ from .retrieve import (
     unpack_vec,
     value_hash,
 )
+from .lifecycle import (
+    DEFAULT_ACCESS_CAP,
+    DEFAULT_ACCESS_HALVE,
+    DEFAULT_PROTECTED_IMPORTANCE,
+    DEFAULT_TTL_DAYS,
+    infer_mtype,
+    is_expired,
+    normalize_mtype,
+    ttl_for,
+)
 from .store import Store, StoreError, resolve_db_path
 
 DEFAULT_MAX_VALUE_LEN = 120  # 单条内容上限（v0.1.0 是硬编码 500，现在可配）
@@ -67,6 +89,9 @@ MAX_NAME = 40  # 主语 / 谓词各自上限
 DEFAULT_DEDUPE_THRESHOLD = 0.95  # 写入相似去重阈值
 DEFAULT_MIN_SCORE = 0.2  # 检索噪声地板（和 retrieve.DEFAULT_MIN_SCORE 一致）
 DEFAULT_INJECT_CHAR_CAP = 600  # 注入内容总字数上限
+DEFAULT_RRF_K = 60  # RRF 融合参数（和 retrieve.DEFAULT_RRF_K 一致）
+DEFAULT_AGREEMENT_BONUS = 0.02  # 两路共识加成
+DEFAULT_MTYPE = "fact"  # default_mtype 的兜底值
 
 CMD_PREFIX = re.compile(r"^[/!！]?\s*(?:mem|记忆)\b\s*", re.IGNORECASE)
 SCOPE_FLAG = re.compile(r"(?:^|\s)--scope\s+(\S+)\s*$", re.IGNORECASE)
@@ -88,22 +113,25 @@ SENSITIVE = re.compile(
 )
 
 HELP = """长期记忆（所有会话共享同一份）
-/mem add <主语> <谓词> <内容>   写事实（同槽 / 同义自动覆盖旧值）
+/mem add <主语> <谓词> <内容>   写事实（同槽 / 同义自动覆盖；--type 指定类型）
 /mem search <关键词> [数量]     检索（向量 + 关键词 + 重排）
 /mem list [数量]                最近记录
 /mem forget <关键词>            作废（保留历史，不物理删）
 /mem stats                      条数 / provider 状态 / 最近更新
 /mem dedupe [--dry-run]         扫同槽重复，只留最新（--dry-run 只报告不改库）
+/mem consolidate [--dry-run]    同主语 + 语义相近的多条合并成一条（保留最完整）
 /mem export [路径]              导出 JSON（默认 ~/mem-export.json）
 /mem import <路径>              导入并合并（同槽 updated_at 新者胜）
+类型：fact 长期 / preference 一年 / event 一个月 / plan 两天（过期不参与检索）
 写操作限管理员 + allowed_users / allowed_groups；读对所有人生效。"""
 
 USAGE = {
-    "add": "/mem add <主语> <谓词> <内容> [--scope group:123]",
+    "add": "/mem add <主语> <谓词> <内容> [--scope group:123] [--type fact|preference|event|plan]",
     "search": "/mem search <关键词> [数量]",
     "list": "/mem list [数量]",
     "forget": "/mem forget <关键词>",
     "dedupe": "/mem dedupe [--dry-run]",
+    "consolidate": "/mem consolidate [--dry-run]",
     "export": "/mem export [文件路径]",
     "import": "/mem import <文件路径>",
 }
@@ -140,18 +168,45 @@ def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
-def parse_add(rest: str) -> tuple[str, str, str, str]:
-    """`<主语> <谓词> <内容> [--scope x]` → (subject, predicate, value, scope)。"""
+def _take_flag(text: str, name: str) -> tuple[str, str]:
+    """从参数尾部摘掉一个 `--name value` / `--name=value`，返回 (值, 剩下的文本)。"""
+    pattern = re.compile(rf"(?:^|\s)--{re.escape(name)}(?:[=\s]+)(\S+)", re.IGNORECASE)
+    match = pattern.search(text or "")
+    if not match:
+        return "", (text or "")
+    rest = f"{(text or '')[: match.start()]} {(text or '')[match.end():]}".strip()
+    return match.group(1).strip(), rest
+
+
+def parse_add_ex(rest: str) -> tuple[str, str, str, str, str, str]:
+    """`<主语> <谓词> <内容> [--scope x] [--type plan] [--importance 0.9]`
+
+    → (subject, predicate, value, scope, mtype, importance)。
+    mtype / importance 留空表示「没显式指定」，由调用方推断 / 取默认。
+    """
     rest = (rest or "").strip()
-    scope = ""
-    m = SCOPE_FLAG.search(rest)
-    if m:
-        scope = m.group(1).strip()
-        rest = rest[: m.start()].rstrip()
+    flags: dict[str, str] = {}
+    for name in ("scope", "type", "importance"):
+        value, rest = _take_flag(rest, name)
+        if value:
+            flags[name] = value
     parts = re.split(r"\s+", rest, maxsplit=2)
     if len(parts) < 3 or not parts[0].strip() or not parts[1].strip() or not parts[2].strip():
         raise ArgError("参数不够：要主语、谓词、内容三段。")
-    return normalize_text(parts[0]), normalize_text(parts[1]), normalize_text(parts[2]), scope
+    return (
+        normalize_text(parts[0]),
+        normalize_text(parts[1]),
+        normalize_text(parts[2]),
+        flags.get("scope", ""),
+        flags.get("type", ""),
+        flags.get("importance", ""),
+    )
+
+
+def parse_add(rest: str) -> tuple[str, str, str, str]:
+    """兼容 v0.2 的四元组接口（自测直接调用它）。"""
+    subject, predicate, value, scope, _mtype, _importance = parse_add_ex(rest)
+    return subject, predicate, value, scope
 
 
 def parse_search(rest: str) -> tuple[str, int]:
@@ -228,13 +283,20 @@ def short_ts(value) -> str:
 
 def format_row(row: dict, *, with_score: bool = False) -> str:
     tag = f"  [已作废 {row['valid_to']}]" if row.get("valid_to") else ""
+    mtype = str(row.get("mtype") or "fact")
     line = (
-        f"#{row.get('id')} [{row.get('scope')}] "
+        f"#{row.get('id')} [{row.get('scope')}] [{mtype}] "
         f"{row.get('subject')} · {row.get('predicate')} = {row.get('value')}{tag}"
     )
     meta = f"更新 {short_ts(row.get('updated_at'))}"
+    decay = row.get("decay")
+    if decay is not None:
+        try:
+            meta = f"衰减 {float(decay):.2f} · {meta}"
+        except (TypeError, ValueError):
+            pass
     if with_score and row.get("score") is not None:
-        meta = f"分 {row['score']} | {meta}"
+        meta = f"分 {row['score']} · {meta}"
     return f"{line}\n    ↳ {meta}"
 
 
@@ -285,15 +347,42 @@ class MemPlugin(Star):
     def _scope(self) -> str:
         return self._conf_str("scope") or "global"
 
+    def _ttl_overrides(self) -> dict:
+        """四种类型的 TTL 配置 → {"fact": 3650, ...}。"""
+        return {
+            "fact": self._conf_float("ttl_fact", DEFAULT_TTL_DAYS["fact"]),
+            "preference": self._conf_float("ttl_preference", DEFAULT_TTL_DAYS["preference"]),
+            "event": self._conf_float("ttl_event", DEFAULT_TTL_DAYS["event"]),
+            "plan": self._conf_float("ttl_plan", DEFAULT_TTL_DAYS["plan"]),
+        }
+
+    def _ttl_for(self, mtype: str) -> float:
+        return ttl_for(mtype, self._ttl_overrides())
+
     # -- 存储 --
     def _get_store(self) -> Store:
         if self._store is not None:
             return self._store
         path = resolve_db_path(self._conf_str("db_path"), warn=logger.warning)
-        store = Store(path)  # 失败抛 StoreError，由调用方转成「记忆库读不了」
+        store = Store(path, warn=logger.warning)  # 失败抛 StoreError，由调用方转成「记忆库读不了」
+        if store.migrated_columns:
+            logger.info(f"[mem] 老库已补列：{', '.join(store.migrated_columns)}")
         self._store_path = path
         self._store = store
         logger.info(f"[mem] 记忆库：{path}")
+        # 衰减回合：非保护记录的 access_count 按 access_halve 回落（默认每小时最多一次），
+        # 防止历史热点靠访问次数永远霸榜。失败只 warning，不影响使用。
+        try:
+            stats = store.apply_decay_pass(
+                access_halve=self._conf_float("access_halve", DEFAULT_ACCESS_HALVE),
+                protected_importance=self._conf_float(
+                    "protected_importance", DEFAULT_PROTECTED_IMPORTANCE
+                ),
+            )
+            if not stats.get("skipped") and stats.get("updated"):
+                logger.info(f"[mem] 衰减回合：{stats['updated']} 条 access_count 已回落")
+        except StoreError as e:
+            logger.warning(f"[mem] 衰减回合跳过：{e}")
         return store
 
     # -- 权限 --
@@ -416,6 +505,12 @@ class MemPlugin(Star):
             recall_k=self._conf_int("recall_k", 30),
             rerank_k=self._conf_int("rerank_k", 5),
             min_score=self._conf_float("min_score", DEFAULT_MIN_SCORE),
+            rrf_k=self._conf_int("rrf_k", DEFAULT_RRF_K),
+            agreement_bonus=self._conf_float("agreement_bonus", DEFAULT_AGREEMENT_BONUS),
+            access_cap=self._conf_int("access_cap", DEFAULT_ACCESS_CAP),
+            protected_importance=self._conf_float(
+                "protected_importance", DEFAULT_PROTECTED_IMPORTANCE
+            ),
             logger=logger,
         )
 
@@ -431,10 +526,23 @@ class MemPlugin(Star):
         )
 
     async def _write_fact(
-        self, scope: str, subject: str, predicate: str, value: str, *, source: str
+        self,
+        scope: str,
+        subject: str,
+        predicate: str,
+        value: str,
+        *,
+        source: str,
+        mtype: str = DEFAULT_MTYPE,
+        importance: float | None = None,
     ) -> dict:
-        """唯一写入通道：指令和 LLM 工具都走这里，保证降噪规则一致。"""
+        """唯一写入通道：指令和 LLM 工具都走这里，保证降噪规则一致。
+
+        mtype 决定 TTL 与衰减方式：plan 2 天 step（过期不参与检索）、event 30 天 exp、
+        preference 365 天 exp、fact 3650 天 exp。
+        """
         store = self._get_store()
+        mtype = normalize_mtype(mtype)
         lookup = await self._similar_ids(store, scope, subject, value)
         result = store.add(
             scope,
@@ -443,6 +551,9 @@ class MemPlugin(Star):
             value,
             source=source,
             supersede_ids=lookup["ids"],
+            mtype=mtype,
+            importance=importance,
+            ttl_days=self._ttl_for(mtype),
         )
         # 新值向量回填缓存：不填的话下次写同主语要把它再算一遍，
         # N 次写入会退化成 O(N²) 次 embedding 调用。
@@ -570,8 +681,10 @@ class MemPlugin(Star):
             return self._cmd_forget(rest, event)
         if action in ("stats", "状态", "统计"):
             return self._cmd_stats()
-        if action in ("dedupe", "合并", "去重"):
+        if action in ("dedupe", "去重"):
             return self._cmd_dedupe(rest, event)
+        if action in ("consolidate", "合并", "整理"):
+            return await self._cmd_consolidate(rest, event)
         if action in ("export", "导出"):
             return self._cmd_export(rest, event)
         if action in ("import", "导入"):
@@ -580,7 +693,7 @@ class MemPlugin(Star):
             return HELP
         raise ArgError(
             f"不认识的子指令「{action}」，可用：add / search / list / forget / stats / "
-            "dedupe / export / import。"
+            "dedupe / consolidate / export / import。"
         )
 
     # ── 子指令实现 ────────────────────────────────────────────────────
@@ -588,16 +701,38 @@ class MemPlugin(Star):
         ok, why = self._allow(event, write=True)
         if not ok:
             return why
-        subject, predicate, value, scope = parse_add(rest)
+        subject, predicate, value, scope, mtype_flag, importance_raw = parse_add_ex(rest)
         problem = self._validate(subject, predicate, value)
         if problem:
             return problem
+
+        if mtype_flag:
+            mtype = normalize_mtype(mtype_flag)
+        else:
+            mtype = infer_mtype(
+                subject, predicate, value, self._conf_str("default_mtype") or DEFAULT_MTYPE
+            )
+        importance = None
+        if importance_raw:
+            try:
+                importance = max(0.0, min(1.0, float(importance_raw)))
+            except ValueError:
+                raise ArgError(f"importance 要 0~1 的小数，收到「{importance_raw}」。") from None
+
         target = scope or self._scope()
-        result = await self._write_fact(target, subject, predicate, value, source="cmd")
-        line = f"已记住 #{result['id']} [{target}] {subject} · {predicate} = {value}"
+        result = await self._write_fact(
+            target, subject, predicate, value, source="cmd", mtype=mtype, importance=importance
+        )
+        line = (
+            f"已记住 #{result['id']} [{target}] [{mtype}] "
+            f"{subject} · {predicate} = {value}"
+        )
         if result["superseded"]:
             old = "、".join(f"#{i}" for i in result["superseded"])
             line += f"\n（旧值已作废：{old}）"
+        ttl = self._ttl_for(mtype)
+        hint = "（过期自动不参与检索）" if mtype == "plan" else ""
+        line += f"\n类型 {mtype} · TTL {ttl:g} 天{hint}"
         return line
 
     async def _cmd_search(self, rest: str, event) -> str:
@@ -609,17 +744,23 @@ class MemPlugin(Star):
         if not result.rows:
             return f"（没检索到「{query}」）"
         head = f"检索到 {len(result.rows)} 条 · {MODE_CN.get(result.mode, result.mode)}"
+        if result.fusion:
+            head += f" · {result.fusion}"
         return head + "\n" + "\n".join(format_row(r, with_score=True) for r in result.rows)
 
     def _cmd_list(self, rest: str) -> str:
         limit = parse_limit(rest, 10)
         store = self._get_store()
-        rows = store.active_rows(limit=limit)
-        if not rows:
-            return "记忆库还是空的。用 /mem add <主语> <谓词> <内容> 记第一条。"
+        protected = self._conf_float("protected_importance", DEFAULT_PROTECTED_IMPORTANCE)
+        rows = store.active_rows(limit=max(limit, limit * 3))
+        fresh = [r for r in rows if not is_expired(r, protected_importance=protected)]
         total = store.stats()["active"]
-        body = "\n".join(format_row(r) for r in rows)
-        return f"最近 {len(rows)} 条（共 {total} 条有效）：\n{body}"
+        if not fresh:
+            if total:
+                return f"最近没有未过期的记录（{total} 条里都已过期，用 /mem export 查历史）。"
+            return "记忆库还是空的。用 /mem add <主语> <谓词> <内容> 记第一条。"
+        body = "\n".join(format_row(r) for r in fresh[:limit])
+        return f"最近 {len(fresh[:limit])} 条（共 {total} 条有效）：\n{body}"
 
     def _cmd_forget(self, rest: str, event) -> str:
         ok, why = self._allow(event, write=True)
@@ -660,6 +801,137 @@ class MemPlugin(Star):
         ids = "、".join(f"#{i}" for i in report["superseded"])
         return f"{head}\n已作废 {len(report['superseded'])} 条：{ids}\n{slots}"
 
+    # ── consolidate：同 scope + 同主语、语义相近的多条合并 ────────────
+
+    @staticmethod
+    def _same_value(left: dict, right: dict) -> bool:
+        return str(left.get("value") or "") == str(right.get("value") or "")
+
+    @staticmethod
+    def _close(left, right, threshold: float) -> bool:
+        if left is None or right is None:
+            return False
+        return cosine(left, right) >= threshold
+
+    async def _consolidation_clusters(self, store: Store, rows: list[dict],
+                                      threshold: float) -> list[list[dict]]:
+        """把同 (scope, subject) 的记录按值向量聚类，返回每组 ≥2 条的簇。
+
+        没有 embedding provider / 阈值 <= 0 时只认「一字不差」，绝不瞎合并。
+        """
+        grouped: dict[tuple[str, str], list[dict]] = {}
+        for row in rows:
+            grouped.setdefault((row.get("scope") or "", row.get("subject") or ""), []).append(row)
+        multi = {key: items for key, items in grouped.items() if len(items) > 1}
+        if not multi:
+            return []
+
+        vec_by_id: dict[int, list[float]] = {}
+        pid, embedder = self._embed_provider()
+        use_cos = embedder is not None and threshold > 0
+        if use_cos:
+            model_key = f"{self._model_key(pid, embedder)}|value"  # 只对 value 算的向量
+            for items in multi.values():
+                for row in items:
+                    vec = await self._cached_value_vector(store, row, embedder, model_key)
+                    if vec is not None:
+                        vec_by_id[int(row["id"])] = vec
+
+        clusters: list[list[dict]] = []
+        for items in multi.values():
+            ordered = sorted(
+                items,
+                key=lambda r: (str(r.get("updated_at") or ""), int(r.get("id") or 0)),
+                reverse=True,
+            )
+            groups: list[list[dict]] = []
+            for row in ordered:
+                placed = False
+                for group in groups:
+                    head = group[0]
+                    if self._same_value(row, head) or self._close(
+                        vec_by_id.get(int(row["id"])),
+                        vec_by_id.get(int(head["id"])),
+                        threshold,
+                    ):
+                        group.append(row)
+                        placed = True
+                        break
+                if not placed:
+                    groups.append([row])
+            clusters.extend([g for g in groups if len(g) > 1])
+        return clusters
+
+    async def _cmd_consolidate(self, rest: str, event) -> str:
+        tokens = [t for t in (rest or "").split() if t]
+        dry_run = any(t in ("--dry-run", "--dry", "-n") for t in tokens)
+        unknown = [t for t in tokens if t not in ("--dry-run", "--dry", "-n")]
+        if unknown:
+            raise ArgError(f"不认识的参数「{' '.join(unknown)}」，用法：{USAGE['consolidate']}")
+        # --dry-run 只读不写，不要求写权限；真合并会改库，按写权限管
+        if not dry_run:
+            ok, why = self._allow(event, write=True)
+            if not ok:
+                return why
+
+        store = self._get_store()
+        rows = store.active_rows()
+        threshold = self._conf_float("dedupe_threshold", DEFAULT_DEDUPE_THRESHOLD)
+        clusters = await self._consolidation_clusters(store, rows, threshold)
+        drops = sum(len(cluster) - 1 for cluster in clusters)
+        head = f"扫描 {len(rows)} 条，可合并 {len(clusters)} 组"
+        if drops:
+            head += f"（涉及 {drops} 条重复）"
+        if not clusters:
+            if threshold <= 0:
+                return head + "\n（dedupe_threshold=0，只合并一字不差的值）没有可合并的记录。"
+            return head + "\n库里没有同 scope + 同主语且语义相近的记录。"
+
+        plans = []
+        for cluster in clusters:
+            keeper = max(
+                cluster,
+                key=lambda r: (
+                    len(str(r.get("value") or "")),
+                    str(r.get("updated_at") or ""),
+                    int(r.get("id") or 0),
+                ),
+            )
+            plans.append(
+                {
+                    "keeper": keeper,
+                    "drop": [r for r in cluster if int(r["id"]) != int(keeper["id"])],
+                    "importance": max(
+                        float(r.get("importance") or 0.0) for r in cluster
+                    ),
+                    "access_count": sum(int(r.get("access_count") or 0) for r in cluster),
+                }
+            )
+
+        def summarize(plan) -> str:
+            keeper = plan["keeper"]
+            return (
+                f"{keeper.get('scope')}|{keeper.get('subject')} → 保留 #{keeper.get('id')}"
+                f"（合并 {len(plan['drop'])} 条，importance {plan['importance']:.2f}，"
+                f"access {plan['access_count']}）"
+            )
+
+        lines = [summarize(plan) for plan in plans[:5]]
+        if dry_run:
+            return f"{head}\n" + "\n".join(lines) + "\n（dry-run）没改库；去掉 --dry-run 才会真的作废旧记录。"
+
+        dropped_ids: list[int] = []
+        for plan in plans:
+            result = store.merge_rows(
+                int(plan["keeper"]["id"]),
+                [int(r["id"]) for r in plan["drop"]],
+                importance=plan["importance"],
+                access_count=plan["access_count"],
+            )
+            dropped_ids.extend(result["dropped"])
+        ids = "、".join(f"#{i}" for i in dropped_ids)
+        return f"{head}\n已作废 {len(dropped_ids)} 条：{ids}\n" + "\n".join(lines)
+
     def _cmd_stats(self) -> str:
         store = self._get_store()
         ep_id, ep = self._embed_provider()
@@ -680,9 +952,12 @@ class MemPlugin(Star):
             rerank_line = f"rerank：{rp_id or '?'}（{self._model_name(rp) or '未知模型'}）"
 
         scopes = "、".join(f"{name} {n} 条" for name, n in st["scopes"]) or "无"
+        types = st.get("types") or {}
+        types_line = "、".join(f"{name} {n}" for name, n in types.items()) or "无"
         lines = [
             f"有效 {st['active']} 条 / 历史 {st['history']} 条",
             f"分池：{scopes}",
+            f"类型：{types_line}",
             embed_line,
             rerank_line,
             f"最近更新：{st['last_updated'] or '（还没有记录）'}",
@@ -717,15 +992,18 @@ class MemPlugin(Star):
 
     # ── LLM 工具 ──────────────────────────────────────────────────────
     @filter.llm_tool(name="memory_add")
-    async def memory_add(self, event: AstrMessageEvent, subject: str, predicate: str, value: str):
+    async def memory_add(self, event: AstrMessageEvent, subject: str, predicate: str,
+                         value: str, mtype: str = ""):
         """记住一条跨会话共享的长期事实（同一主语+谓词会覆盖旧值）。
 
         value 必须是一句判断句：主语 + 谓词 + 值，尽量 ≤120 字；不要写日记体过程。
+        mtype 决定记忆寿命：fact 长期、preference 一年、event 一个月、plan 两天。
 
         Args:
             subject(string): 主语，例如「点点」或「用户的服务器」
             predicate(string): 谓词，例如「喜欢」或「部署在」
             value(string): 内容（一句事实，≤120 字；以「我/他/她/今天/昨天」开头的叙事会被拒）
+            mtype(string): 可选，fact / preference / event / plan；留空自动判断（含「待办/明天」等线索判 plan）
         """
         ok, why = self._allow(event, write=True)
         if not ok:
@@ -736,12 +1014,20 @@ class MemPlugin(Star):
         problem = self._validate(subject, predicate, value)
         if problem:
             return problem
+        if mtype:
+            resolved = normalize_mtype(mtype)
+        else:
+            resolved = infer_mtype(
+                subject, predicate, value, self._conf_str("default_mtype") or DEFAULT_MTYPE
+            )
         try:
-            result = await self._write_fact(self._scope(), subject, predicate, value, source="llm")
+            result = await self._write_fact(
+                self._scope(), subject, predicate, value, source="llm", mtype=resolved
+            )
         except StoreError as e:
             logger.warning(f"[mem] 工具写入失败：{e}")
             return f"记忆库读不了：{e}"
-        line = f"已记住 #{result['id']}：{subject} · {predicate} = {value}"
+        line = f"已记住 #{result['id']} [{resolved}]：{subject} · {predicate} = {value}"
         if result["superseded"]:
             old = "、".join(f"#{i}" for i in result["superseded"])
             line += f"（旧值已作废：{old}）"

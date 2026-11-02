@@ -20,10 +20,10 @@ LLM 工具：memory_add / memory_search（`@filter.llm_tool`）。
 `dedupe_threshold`）也走覆盖。检索输出按 (subject, predicate) 只留最新一条，噪声地板
 `min_score`。
 
-搬家（v0.4.0，实现在 livingmemory.py）：`/mem import-lm` 自己找 LivingMemory 的库，
+搬家（v0.4.0，实现在 core/livingmemory.py）：`/mem import-lm` 自己找 LivingMemory 的库，
 **只读**打开、切三元组、分批写进来，用户不用导文件。
 
-记忆生命周期（v0.3.0，实现在 lifecycle.py）：每条记录带 mtype / importance / ttl_days /
+记忆生命周期（v0.3.0，实现在 core/lifecycle.py）：每条记录带 mtype / importance / ttl_days /
 decay_type / last_accessed_at / access_count。四种类型 fact(3650d exp) / preference(365d exp) /
 event(30d exp) / plan(2d step)。检索时 `final = base * decay * (0.5 + 0.5*importance)`，
 decay 按年龄算、按 access_count 强化（`access_cap` 封顶），`importance >= protected_importance`
@@ -67,27 +67,51 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
 
-from .retrieve import (
-    EMBED_TIMEOUT,
-    Retriever,
-    cosine,
-    pack_vec,
-    unpack_vec,
-    value_hash,
-)
-from .lifecycle import (
-    DEFAULT_ACCESS_CAP,
-    DEFAULT_ACCESS_HALVE,
-    DEFAULT_PROTECTED_IMPORTANCE,
-    DEFAULT_TTL_DAYS,
-    infer_mtype,
-    is_expired,
-    normalize_mtype,
-    ttl_for,
-)
-from .livingmemory import LivingMemoryError, format_not_found, format_report, probe, run_import
-from .store import Store, StoreError, astrbot_data_dirs, resolve_db_path
-from .textnorm import normalize_text
+# 双写兜底：AstrBot 按包导入插件（`.core.x`）；直接跑 / 平铺加载时走 `core.x`。
+try:
+    from .core.retrieve import (
+        EMBED_TIMEOUT,
+        Retriever,
+        cosine,
+        pack_vec,
+        unpack_vec,
+        value_hash,
+    )
+    from .core.lifecycle import (
+        DEFAULT_ACCESS_CAP,
+        DEFAULT_ACCESS_HALVE,
+        DEFAULT_PROTECTED_IMPORTANCE,
+        DEFAULT_TTL_DAYS,
+        infer_mtype,
+        is_expired,
+        normalize_mtype,
+        ttl_for,
+    )
+    from .core.livingmemory import LivingMemoryError, format_not_found, format_report, probe, run_import
+    from .core.store import Store, StoreError, astrbot_data_dirs, resolve_db_path
+    from .core.textnorm import normalize_text
+except ImportError:  # pragma: no cover - 只在平铺加载时命中
+    from core.retrieve import (
+        EMBED_TIMEOUT,
+        Retriever,
+        cosine,
+        pack_vec,
+        unpack_vec,
+        value_hash,
+    )
+    from core.lifecycle import (
+        DEFAULT_ACCESS_CAP,
+        DEFAULT_ACCESS_HALVE,
+        DEFAULT_PROTECTED_IMPORTANCE,
+        DEFAULT_TTL_DAYS,
+        infer_mtype,
+        is_expired,
+        normalize_mtype,
+        ttl_for,
+    )
+    from core.livingmemory import LivingMemoryError, format_not_found, format_report, probe, run_import
+    from core.store import Store, StoreError, astrbot_data_dirs, resolve_db_path
+    from core.textnorm import normalize_text
 
 DEFAULT_MAX_VALUE_LEN = 120  # 单条内容上限（v0.1.0 是硬编码 500，现在可配）
 MAX_VALUE = DEFAULT_MAX_VALUE_LEN  # 兼容旧引用

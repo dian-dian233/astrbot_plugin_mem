@@ -154,6 +154,28 @@ AstrBot 自带的长期记忆有两个毛病，用久了很明显。
 PYTHONDONTWRITEBYTECODE=1 python3 selftest.py --offline   # 当前 308 条断言
 ```
 
+
+## 目录结构
+
+v0.5.0 起按职责分层，根目录只留入口和元数据：
+
+```
+astrbot_plugin_mem/
+├── main.py              Star 子类：指令、LLM 工具、注入钩子
+├── core/
+│   ├── store.py         sqlite 存取、覆盖语义、导入导出
+│   ├── retrieve.py      召回 / RRF 融合 / 重排 / 降级
+│   ├── lifecycle.py     TTL / 衰减 / 访问强化
+│   ├── livingmemory.py  从 LivingMemory 搬家
+│   └── textnorm.py      归一化与三元组切分
+├── _conf_schema.json    配置项
+├── metadata.yaml        插件元数据
+├── selftest.py          离线自测（假 astrbot 桩）
+└── README.md
+```
+
+`core/` 里不许 `import astrbot`，业务逻辑保持可脱离框架单测。
+
 ## License
 
 MIT

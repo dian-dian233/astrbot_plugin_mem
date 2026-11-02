@@ -861,8 +861,8 @@ async def test_db_path(main_mod, tmp, chk: Checker) -> None:
 
 
 def _mod(name: str):
-    """按包名取兄弟模块（load_plugin 之后它们已经在 sys.modules 里）。"""
-    return sys.modules[f"{PKG_NAME}.{name}"]
+    """按包名取 core/ 下的模块（load_plugin 之后它们已经在 sys.modules 里）。"""
+    return sys.modules[f"{PKG_NAME}.core.{name}"]
 
 
 async def test_lifecycle_plan_ttl(main_mod, tmp, chk: Checker) -> None:

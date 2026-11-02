@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import hashlib
 import json
 import os
 import sqlite3
@@ -218,6 +219,23 @@ def resolve_db_path(configured: str = "", *, plugin_dir: str = PLUGIN_DIR, warn=
     return os.path.join(fallback_dir, DEFAULT_DB_NAME)
 
 
+def astrbot_data_dirs() -> list[str]:
+    """AstrBot data 目录候选（**只返回真实存在的**，按优先级去重）。
+
+    给「从 LivingMemory 搬家」找对方的库用：读别人的库不需要能写，所以不建目录。
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for cand, _allow_create in _data_candidates():
+        path = os.path.realpath(os.path.abspath(os.path.expanduser(cand)))
+        if path in seen:
+            continue
+        seen.add(path)
+        if os.path.isdir(path):
+            out.append(path)
+    return out
+
+
 # ── 工具 ───────────────────────────────────────────────────────────────
 
 
@@ -253,12 +271,34 @@ def _parse_ts(value: str) -> datetime | None:
         return None
 
 
+def _aware(moment: datetime) -> datetime:
+    """补时区：naive 当本地时间。
+
+    外部导入的时间串（比如从别的插件搬来的 ISO）可能没有偏移量，直接和 `now_iso()`
+    的 aware 串比 `datetime` 会抛 `TypeError: can't compare offset-naive and
+    offset-aware datetimes`；先补齐再比。
+    """
+    if moment.tzinfo is None:
+        return moment.replace(tzinfo=datetime.now().astimezone().tzinfo or timezone.utc)
+    return moment
+
+
 def _newer(left: str, right: str) -> bool:
     """left 是否比 right 新（ISO 串解析失败就退回字符串比较）。"""
     a, b = _parse_ts(left), _parse_ts(right)
     if a is not None and b is not None:
-        return a > b
+        return _aware(a) > _aware(b)
     return str(left or "") > str(right or "")
+
+
+def content_hash(subject: str, predicate: str, value: str) -> str:
+    """同 subject + predicate + value → 同一个哈希（跨批次去重用）。
+
+    和 `retrieve.value_hash` 的区别：那个只哈希 value（给 embedding 缓存做键），
+    这个哈希整个三元组（判断「这条事实库里已经有了」）。
+    """
+    raw = f"{subject}\x1f{predicate}\x1f{value}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 class Store:
@@ -853,3 +893,99 @@ class Store:
                 (rec["updated_at"], new_id, rec["updated_at"], old["id"]),
             )
             return "updated"
+
+    # ── 批量导入（LivingMemory 搬家） ──────────────────────────────────
+
+    @_db_guard
+    def import_records(self, records, *, dry_run: bool = False, state: dict | None = None) -> dict:
+        """一批记录一次连接写完：内容重复跳过，同槽新者胜。
+
+        和 `add()` / `import_json()` 的区别：
+        - 一次连接写一整批（搬几千条时不要一条一个连接）；
+        - **不碰 embedding**（一条一个 HTTP 请求会把搬家拖成几分钟）；
+        - 去重靠 `content_hash(subject, predicate, value)`，跟库里已有的有效行比；
+        - `dry_run=True` 走完全相同的写入路径再 `rollback()`，所以 `--dry-run` 报出来的
+          数字就是真跑的数字，不是另写一套估算逻辑。
+
+        `state` 是**跨批次**的去重状态（`{"contents": set, "slots": dict, "loaded": bool}`）：
+        搬家是分批写的，而 dry-run 每批都会回滚 —— 不把状态传出去的话，第二批就看不到
+        第一批写过的内容，报出来的「重复」会比真跑少。传同一个 `state` 进来即可对齐。
+
+        返回：{added, updated, duplicate, stale, invalid, outcomes}，
+        `outcomes` 逐条对应输入顺序（added / updated / duplicate / stale / invalid），
+        调用方拿它统计「切出三元组 / 退回整体」各多少条。
+        """
+        added = updated = duplicate = stale = invalid = 0
+        outcomes: list[str] = []
+        columns = (
+            "scope", "subject", "predicate", "value", "confidence", "source",
+            "created_at", "updated_at", "valid_from", "mtype", "importance",
+            "ttl_days", "decay_type", "last_accessed_at", "access_count",
+        )
+        with self._conn() as conn:
+            if state is None:
+                state = {}
+            if not state.get("loaded"):
+                rows = conn.execute(
+                    "SELECT id, scope, subject, predicate, value, updated_at "
+                    "FROM mem WHERE valid_to IS NULL"
+                ).fetchall()
+                state["contents"] = {
+                    content_hash(r["subject"], r["predicate"], r["value"]) for r in rows
+                }
+                state["slots"] = {
+                    (r["scope"], r["subject"], r["predicate"]): {
+                        "id": int(r["id"]), "updated_at": r["updated_at"] or "",
+                    }
+                    for r in rows
+                }
+                state["loaded"] = True
+            contents = state["contents"]
+            slots = state["slots"]
+            for raw in records:
+                try:
+                    rec = self._normalize_import_item(raw, "livingmemory")
+                except ValueError:
+                    invalid += 1
+                    outcomes.append("invalid")
+                    continue
+                key = content_hash(rec["subject"], rec["predicate"], rec["value"])
+                if key in contents:
+                    duplicate += 1
+                    outcomes.append("duplicate")
+                    continue
+                slot = (rec["scope"], rec["subject"], rec["predicate"])
+                old = slots.get(slot)
+                if old is not None and not _newer(rec["updated_at"], old["updated_at"]):
+                    stale += 1
+                    outcomes.append("stale")
+                    continue
+                cur = conn.execute(
+                    f"INSERT INTO mem({','.join(columns)}) "
+                    f"VALUES({','.join('?' * len(columns))})",
+                    [rec[name] for name in columns],
+                )
+                new_id = int(cur.lastrowid)
+                if old is not None:
+                    conn.execute(
+                        "UPDATE mem SET valid_to=?, superseded_by=?, updated_at=? "
+                        "WHERE id=? AND valid_to IS NULL",
+                        (rec["updated_at"], new_id, rec["updated_at"], old["id"]),
+                    )
+                    updated += 1
+                    outcomes.append("updated")
+                else:
+                    added += 1
+                    outcomes.append("added")
+                contents.add(key)
+                slots[slot] = {"id": new_id, "updated_at": rec["updated_at"]}
+            if dry_run:
+                conn.rollback()
+        return {
+            "added": added,
+            "updated": updated,
+            "duplicate": duplicate,
+            "stale": stale,
+            "invalid": invalid,
+            "outcomes": outcomes,
+        }

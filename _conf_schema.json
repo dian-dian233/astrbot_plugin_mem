@@ -5,6 +5,12 @@
     "hint": "留空 = AstrBot data 目录下的 mem.db（推荐）。不要填插件代码目录，升级插件会丢数据。",
     "default": ""
   },
+  "lm_db_path": {
+    "description": "LivingMemory 库路径（搬家用）",
+    "type": "string",
+    "hint": "留空 = 自动探测（AstrBot data 目录下的 plugin_data/astrbot_plugin_livingmemory/ 等 4 个候选，再退递归 ≤4 层）。只有自动探测找不到时才需要填，或临时用 /mem import-lm --path 指定。",
+    "default": ""
+  },
   "scope": {
     "description": "默认作用域（写入归属）",
     "type": "string",

@@ -2,7 +2,7 @@
 
 给 AstrBot 用的**全局记忆**插件：任何私聊、任何群聊、任何号，读写同一份事实库，不按会话隔离。
 
-> 状态：**v0.3.0（记忆生命周期 + RRF 融合 + consolidate）** 在分支 `feat/v0.3-lifecycle`，等点点 review。
+> 状态：**v0.4.0（+ 从 LivingMemory 直接搬家 `/mem import-lm`）** 在分支 `feat/import-lm`，等点点 review。
 > v0.1.0 / v0.2.0 的库**启动时自动迁移**（补列，不丢数据）；升级后建议先跑 `/mem stats` 和
 > `/mem consolidate --dry-run` 看一眼家底。
 
@@ -19,12 +19,13 @@ AstrBot 自带的长期记忆有两个问题：注入的是二次加工摘要（
 
 ## 能力
 
-- 指令：`/mem add | search | list | forget | stats | dedupe | consolidate | export | import`
+- 指令：`/mem add | search | list | forget | stats | dedupe | consolidate | export | import | import-lm`
 - LLM 工具：`memory_add` / `memory_search`
 - **写入降噪**（v0.2.0）：一句判断句、≤120 字、拒叙事体、同槽 / 同义覆盖优先于追加
 - **记忆生命周期**（v0.3.0）：四种类型 + TTL + 三种衰减曲线 + 访问强化；待办过期自动不参与检索
 - **RRF 融合检索**（v0.3.0）：向量路 + BM25 关键词路 → 倒数排名融合 → 重排 → decay 加权
 - **`/mem consolidate`**（v0.3.0）：同 scope + 同主语、语义相近的多条合并成一条
+- **`/mem import-lm`**（v0.4.0）：从 LivingMemory 插件直接搬家——自己找库、只读打开、切三元组，不用你导出文件
 - **默认不注入**（`auto_inject_n = 0`）：不往 prompt 里塞记忆，避免污染人格、也护住 prompt 缓存
 - 向量召回 + 重排：**复用 AstrBot 里已配置的 embedding / rerank provider**，插件自己不碰 key
 - 三级降级：向量挂 → 关键词；重排挂 → 向量序；全挂 → 纯关键词
@@ -142,6 +143,7 @@ git clone https://github.com/dian-dian233/astrbot_plugin_mem.git
 | 配置项 | 默认 | 说明 |
 | --- | --- | --- |
 | `db_path` | 空 | 空 = AstrBot `data/mem.db`（推荐）。填了就用填的；指到插件代码目录会被拒绝（升级会丢数据） |
+| `lm_db_path` | 空 | LivingMemory 的 `livingmemory.db` 路径，**只给 `/mem import-lm` 用**。空 = 自动探测（4 个固定候选 → 递归 ≤4 层） |
 | `scope` | `global` | 写入归属。默认全局一份，所有会话共享 |
 | `embed_provider_id` | 空 | 空 = 自动挑第一个已配置的 embedding provider |
 | `rerank_provider_id` | 空 | 空 = 自动挑第一个已配置的 rerank provider |
@@ -189,6 +191,7 @@ git clone https://github.com/dian-dian233/astrbot_plugin_mem.git
 | **`/mem consolidate [--dry-run]`** | 扫**同主语语义相近**：cos ≥ `dedupe_threshold` 的多条合并成一条 |
 | `/mem export [路径]` | 导出 JSON（默认 `~/mem-export.json`） |
 | `/mem import <路径>` | 导入并合并：同槽按 `updated_at` 新者胜 |
+| **`/mem import-lm [--dry-run] [--path <db>] [--limit N]`** | 从 LivingMemory 插件直接搬家（自动找库，见「从 LivingMemory 搬家」一节） |
 
 例子：
 
@@ -215,6 +218,93 @@ global|点点 → 保留 #17（合并 2 条，importance 0.80，access 6）
 ```
 
 `--dry-run` 只读，不要求写权限；真跑会改库，走写权限（管理员 / 白名单）。
+
+## 从 LivingMemory 搬家（v0.4.0）
+
+装了 `astrbot_plugin_livingmemory` 想换过来？不用导出文件：两个插件装在同一台 AstrBot 上，
+数据目录是同一棵树，本插件自己去找库、**只读**打开、切三元组写进自己的库。
+
+```
+/mem import-lm                              # 自动找库，直接搬
+/mem import-lm --dry-run                    # 只统计，一个字不写
+/mem import-lm --limit 200                  # 先搬 200 条试试水
+/mem import-lm --path /app/data/plugin_data/astrbot_plugin_livingmemory/livingmemory.db
+/mem import-lm --path "C:\Program Files\AstrBot\data\plugin_data\astrbot_plugin_livingmemory\livingmemory.db"
+```
+
+出来是一条消息（不刷屏）：
+
+```
+LivingMemory 搬家：/app/data/plugin_data/astrbot_plugin_livingmemory/livingmemory.db
+表：memory_atoms
+读入 1234 条 → 导入 987 条（切出三元组 870 / 退回整体 117）
+跳过：已存在重复 132、非活跃 115
+用时 1.8s
+```
+
+### 自动探测顺序
+
+| 顺序 | 位置 | 说明 |
+| --- | --- | --- |
+| 1 | 配置项 `lm_db_path` | 填了就只认它（指到目录会补 `livingmemory.db`），不对就报错并列出位置 |
+| 2 | `plugin_data/astrbot_plugin_livingmemory/livingmemory.db` | **实际最常见**：对方 `main.py:106` 用 `StarTools.get_data_dir("astrbot_plugin_livingmemory")` |
+| 3 | `plugin_data/livingmemory/livingmemory.db` | 改过名的部署 |
+| 4 | `livingmemory/livingmemory.db` | 早期版本 |
+| 5 | `plugins/astrbot_plugin_livingmemory/data/livingmemory.db` | 把数据放插件目录里的部署 |
+| 6 | **递归兜底** | 在 data 目录下找文件名恰为 `livingmemory.db` 的文件，**深度 ≤ 4 层**，跳过 `site-packages` / `node_modules` / `.venv` / `venv` / `__pycache__` / `.git` 等 |
+
+2–5 的路径都相对 AstrBot **data 目录**。data 目录按
+`astrbot.core.utils.astrbot_path.get_astrbot_data_path()` 取（认 `ASTRBOT_ROOT`；
+本插件另外认 `ASTRBOT_DATA_DIR` / `MEM_DATA_DIR` 环境变量），插件装在
+`<root>/data/plugins/xxx` 时也会从插件目录反推。
+
+都没命中就回下面这句，并把搜过的每个位置列出来（不再抛 traceback）：
+
+```
+没找到 LivingMemory 的库，可手动指定 /mem import-lm --path <livingmemory.db>
+找过这些位置：
+  · /app/data/plugin_data/astrbot_plugin_livingmemory/livingmemory.db
+  · ...
+```
+
+### 字段映射（`memory_atoms` → `mem`）
+
+| LivingMemory 列 | 本插件列 | 规则 |
+| --- | --- | --- |
+| `content` | `subject` / `predicate` / `value` | 按 15 个谓词切三元组：是 / 位于 / 属于 / 叫做 / 叫 / 住在 / 住 / 在 / 有 / 喜欢 / 用 / 负责 / 需要 / 要 / 等于。命中位置须满足 `1 < idx ≤ 24`（主语 2~24 字），否则退回 `遗留记忆 / 内容 / 原文` |
+| `atom_type` | `mtype` | `episodic→event`、`semantic/factual/relational→fact`、`procedural/preference→preference`、`planned→plan`、`unknown/其他→fact` |
+| `importance` | `importance` | 原样带过（夹到 0~1） |
+| `confidence` | `confidence` | 原样带过 |
+| `created_at` / `last_accessed_at` | `created_at` / `last_accessed_at` | epoch 浮点 → 本地时区 ISO；本来就是 ISO 串也认；认不出来用当前时间 |
+| `ttl_days` | `ttl_days` | 原样带过；缺列 / NULL / 脏值 → 按本插件该类型默认 TTL（fact 3650 / preference 365 / event 30 / plan 2） |
+| `decay_type` | `decay_type` | `exponential→exp`、`linear→linear`、`step→step`，其它→`exp` |
+| `reinforcement_count` | `access_count` | 原样带过 |
+| `session_id` / `persona_id` | —— | **丢弃**（本插件用 `scope` 分池，塞进 value 只会污染检索），但计数上报 |
+| 其它 JSON 列（`entities` / `metadata` / `expires_at`） | —— | 不搬（`expires_at` 由 TTL 重算） |
+
+### 跳过 / 覆盖规则
+
+| 情况 | 处理 | 报告里的计数 |
+| --- | --- | --- |
+| `status != 'active'`（archived / forgotten / superseded …） | 跳过 | 非活跃 |
+| 同 `(主语, 谓词, 值)` 的内容哈希库里已存在 | 跳过 | 已存在重复 |
+| 同上，但只是**同一批里**重复 | 第二条跳过 | 已存在重复 |
+| 同槽 `(主语, 谓词)` 来了新值 | 覆盖：旧行填 `valid_to` + `superseded_by`，新值生效（不物理删） | 覆盖同槽旧值 |
+| 同槽新值比库里现有记录还旧 | 跳过（老数据不许盖新数据） | 旧于现有 |
+| 内容为空 | 跳过 | 空内容 |
+
+### 三条实现约束
+
+- **只读对方库**：连接一律 `file:...?mode=ro`；WAL 库在只读挂载下打不开时退 `mode=ro&immutable=1`。
+  `--dry-run` 走完全相同的写入路径再 `rollback()`，所以报出来的数字就是真跑的数字。
+- **列名不硬编**：`PRAGMA table_info` 取到什么用什么，缺列按默认值补。`memory_atoms` 不在时依次试
+  `memory_documents` / `memories`；都没有就回一句「没找到含 content 列的表」。
+- **边读边写**：每 500 条一批交给 `Store.import_records`，大库不吃满内存；一批一个 sqlite 连接。
+- **不做 embedding**：一条一个 HTTP 请求会把上千条拖成几分钟。所以搬进来的记录暂时没有向量缓存，
+  第一次 `/mem search` 时会现算（`/mem stats` 的「已缓存 N 条向量」会从 0 慢慢涨）。
+
+> 搬过来的 `plan` 保留原始 `created_at`，所以**已经超过 2 天的待办搬进来就直接不参与检索**（正常的
+> TTL 语义，不是丢数据：`/mem export` 仍能看到）。想留就 `/mem add ... --type fact` 重写一条。
 
 ## LLM 工具
 
@@ -338,6 +428,11 @@ access_count INTEGER NOT NULL DEFAULT 0
 | 回复「记忆库读不了：file is not a database」 | `db_path` 指到了非 sqlite 文件 / 文件损坏 | 改 `db_path` 或把坏文件挪走；插件不会覆盖它 |
 | 回复「没权限写记忆」 | 不在白名单 | 把自己的号加进 `allowed_users`，或把群号加进 `allowed_groups` |
 | 升级插件后记忆没了 | `db_path` 填在了插件代码目录 | 默认会拒绝这种路径并回落到 data 目录，检查日志里的 `[mem]` 提示 |
+| `/mem import-lm` 回「没找到 LivingMemory 的库」 | 对方没装在这台机器 / 装在别的 data 目录 / 容器里路径不同 | 按回复里列出的位置核对，或用 `--path` 指到 `livingmemory.db`（容器里也得是容器内路径） |
+| `/mem import-lm` 回「没找到 memory_atoms / memory_documents / memories」 | 那个库不是 LivingMemory 的（或版本差异太大） | 确认 `--path` 指向的是 `livingmemory.db`；用 `sqlite3 xxx.db ".tables"` 看一眼 |
+| 搬家后条数比预期少 | `status != active` 的行被跳过、重复内容被跳过、`--limit` 截断 | 报告里三行计数对着看；先 `--dry-run` 摸底 |
+| 搬进来的待办搜不到 | plan 保留原始 `created_at`，超过 2 天 TTL 就不参与检索 | 正常 TTL 语义；需要长期保留就 `/mem add ... --type fact` 重写 |
+| 搬家后第一次 `/mem search` 变慢 | 搬家不写向量缓存（不走 embedding），首次检索现算 | 正常；`/mem stats` 的「已缓存 N 条向量」会慢慢涨 |
 | 日志出现 `[mem] 老库迁移：mem 表补上 ...` | 首次启动 v0.3.0，正在补列 | 正常，只发生一次；旧数据默认 fact / 3650 天 |
 | 日志刷 `记忆注入失败，本轮跳过` | `auto_inject_n>0` 但检索链路出错 | 不影响聊天；按上面的 provider 排查，或把 `auto_inject_n` 设回 0 |
 
@@ -352,7 +447,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 selftest.py --offline
 期望输出最后一行：
 
 ```
-204/204 通过
+308/308 通过
 ```
 
 覆盖：add→search、同槽覆盖、forget、超长/敏感词、库损坏、白/黑名单、注入开关、
@@ -363,6 +458,12 @@ v0.2.0 新增（39 条）：120/121 字边界、叙事体拒写、归一化（�
 相似去重（cos 0.97 合并、0.8 不合并、无 provider 跳过、embedding 挂了照样写、
 `dedupe_threshold=0` 关闭）、检索 `(主语,谓词)` 去重 + 更新时间展示 + 作废标注、
 `min_score` 双阈值对比、`/mem dedupe` 的 dry-run 与真跑、注入按主语去重 + `inject_char_cap` 裁剪。
+
+v0.4.0 新增（104 条）：假的 `livingmemory.db`（schema 照抄对方 `storage/atom_store.py`）端到端搬家、
+切分规则（长谓词优先 / 1<idx≤24 / 长叙事退回整体）、atom_type 与 decay_type 映射、epoch↔ISO 转换、
+`status != active` 跳过、内容重复跳过、同槽新者胜 + 旧的不许盖新的、`--dry-run` 不改库、
+`--limit` 截断、缺列（只有 id/content/importance）也能导入、只读句柄写不进去、
+自动探测顺序与递归深度上限、跳过 `site-packages`、找不到库报错里列出搜过的路径且不抛 traceback。
 
 v0.3.0 新增（78 条）：plan 过 TTL 后掉出检索（假时钟注入）、fact 30 天后仍在但 decay 压低分数、
 三种衰减公式数值、访问强化与 `access_cap` 封顶、衰减回合 `access_count × 0.5` 与小时级节流、
@@ -390,7 +491,7 @@ v0.2 老库自动迁移、类型识别与四种 TTL 落库。
 
 | 角色 | 职责 |
 | --- | --- |
-| 点点·小弟 | 写实现、开分支 `feat/v0.3-lifecycle`、push、写自测 |
+| 点点·小弟 | 写实现、开分支 `feat/import-lm`、push、写自测 |
 | 点点 | 看 diff → 在 friend-box 用 `fbci.sh` 跑构建与自测原始输出 → 判定合不合并 |
 
 只开 PR，不直推 main。

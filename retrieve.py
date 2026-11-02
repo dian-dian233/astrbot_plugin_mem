@@ -1,18 +1,18 @@
-"""召回 / 重排 / 三级降级。**不 import astrbot**，embedder 和 reranker 都是注入进来的
+"""召回 / 融合 / 重排 / 衰减加权。**不 import astrbot**，embedder 和 reranker 都是注入进来的
 可调用对象，所以离线单测能跑全链路。
 
-检索链路（按规格）：
+检索链路（v0.3.0，顺序不能乱）：
 
-    关键词 LIKE 召回 ┐
-                     ├→ 按 mem id 去重 → 向量打分 → rerank 取 top-K → 输出
-    向量召回        ┘
+    向量 top-k ┐
+               ├→ RRF 融合 → rerank → decay 加权 → 截断 → 输出
+    关键词 top-k ┘
 
-降级链（任何一级失败只记 note，绝不给用户抛错）：
+RRF：score = Σ 1/(rrf_k + rank)，`rrf_k` 默认 60；两路都命中且名次接近时加
+`agreement_bonus`（默认 0.02，按名次差线性衰减）。某一路为空就只用另一路，
+不拿空路稀释（空路没有 rank，自然不贡献分数）。
 
-    1. 向量 + 重排都通       → mode = "vector+rerank"
-    2. 向量通、重排挂        → mode = "vector"
-    3. 向量挂、重排通        → mode = "keyword+rerank"
-    4. 全挂 / 没配 provider   → mode = "keyword"
+降权：`final = base * decay * (0.5 + 0.5 * importance)`，decay 见 lifecycle.py。
+plan（step）过 TTL 直接剔除，不参与融合。
 
 向量缓存：vec 表按 (mem_id, model) 存 float32；同一 model 下内容哈希没变就不重复
 调 embedding。model_key 变了（换模型 / 换维度）→ 缓存全部视为过期，先按关键词出结果，
@@ -28,11 +28,22 @@ import math
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from .lifecycle import (
+    DEFAULT_ACCESS_CAP,
+    DEFAULT_PROTECTED_IMPORTANCE,
+    final_score,
+    is_expired,
+)
+
 DEFAULT_RECALL_K = 30
 DEFAULT_RERANK_K = 5
 EMBED_TIMEOUT = 15.0  # 秒；embedding 调用超时即降级
 RERANK_TIMEOUT = 20.0  # 秒；rerank 调用超时即降级
 DEFAULT_MIN_SCORE = 0.2  # 噪声地板默认值（可用配置 min_score 覆盖）
+DEFAULT_RRF_K = 60  # RRF 排名衰减参数（论文推荐值）
+DEFAULT_AGREEMENT_BONUS = 0.02  # 两路共识加成上限
+BM25_K1 = 1.5
+BM25_B = 0.75
 MIN_VECTOR_SCORE = DEFAULT_MIN_SCORE  # 兼容旧引用；实际取 Retriever.min_score
 
 
@@ -141,6 +152,97 @@ def keyword_score(row: dict, terms: list[str]) -> float:
     return hits / len(terms)
 
 
+def bm25_scores(rows: list[dict], terms: list[str], *, k1: float = BM25_K1,
+                b: float = BM25_B) -> dict[int, float]:
+    """BM25 式关键词打分（纯 Python，不引 jieba）。
+
+    中文没有分词，term 直接用查询词本身，在 `主语|谓词|值` 里数出现次数；
+    `dl` 是文档字符长度，`avgdl` 是本次候选集平均长度，`idf` 按候选集内文档频率算。
+    只给召回到的候选打分（N 是候选集大小），够用来排名，不追求全局 IDF 稳定。
+    """
+    if not rows or not terms:
+        return {}
+    docs: dict[int, str] = {}
+    for row in rows:
+        try:
+            doc_id = int(row["id"])
+        except (TypeError, ValueError):
+            continue
+        docs[doc_id] = (
+            f"{row.get('subject', '')}|{row.get('predicate', '')}|{row.get('value', '')}"
+        ).lower()
+    if not docs:
+        return {}
+    n = len(docs)
+    lengths = {doc_id: max(1, len(text)) for doc_id, text in docs.items()}
+    avgdl = sum(lengths.values()) / float(n)
+    df = {term: sum(1 for text in docs.values() if term in text) for term in terms}
+    out: dict[int, float] = {}
+    for doc_id, text in docs.items():
+        dl = lengths[doc_id]
+        score = 0.0
+        for term in terms:
+            tf = text.count(term)
+            if tf <= 0:
+                continue
+            idf = math.log(1.0 + (n - df[term] + 0.5) / (df[term] + 0.5))
+            score += idf * (tf * (k1 + 1)) / (tf + k1 * (1.0 - b + b * dl / avgdl))
+        out[doc_id] = score
+    return out
+
+
+def rrf_fuse(vec_ids: list[int], kw_ids: list[int], *, k: int = DEFAULT_RRF_K,
+             agreement_bonus: float = 0.0) -> dict[int, dict]:
+    """Reciprocal Rank Fusion：score(d) = Σ 1/(k + rank_i(d))。
+
+    Args:
+        vec_ids: 向量路召回，按相似度降序的 mem id
+        kw_ids: 关键词路召回，按 BM25 降序的 mem id
+        k: RRF 参数，越大越平滑（默认 60）
+        agreement_bonus: 两路都命中时的共识加成上限；名次越接近加得越多
+
+    Returns:
+        {mem_id: {"score", "vec_rank", "kw_rank", "best_rank"}}
+
+    某一路为空时，另一路的 rank 照算 —— 空路不贡献分数，也就不会稀释结果。
+    """
+    vec_list = [int(i) for i in (vec_ids or [])]
+    kw_list = [int(i) for i in (kw_ids or [])]
+    if not vec_list and not kw_list:
+        return {}
+    try:
+        rrf_k = max(1, int(k))
+    except (TypeError, ValueError):
+        rrf_k = DEFAULT_RRF_K
+    try:
+        bonus_cap = max(0.0, float(agreement_bonus or 0.0))
+    except (TypeError, ValueError):
+        bonus_cap = 0.0
+
+    vec_rank = {doc: rank for rank, doc in enumerate(vec_list)}
+    kw_rank = {doc: rank for rank, doc in enumerate(kw_list)}
+    span = max(len(vec_list), len(kw_list), 1)
+
+    fused: dict[int, dict] = {}
+    for doc in set(vec_rank) | set(kw_rank):
+        score = 0.0
+        if doc in vec_rank:
+            score += 1.0 / (rrf_k + vec_rank[doc] + 1)
+        if doc in kw_rank:
+            score += 1.0 / (rrf_k + kw_rank[doc] + 1)
+        if bonus_cap and doc in vec_rank and doc in kw_rank:
+            gap = abs(vec_rank[doc] - kw_rank[doc])
+            score += bonus_cap * (1.0 - gap / span)  # 名次越接近越可信
+        ranks = [r for r in (vec_rank.get(doc), kw_rank.get(doc)) if r is not None]
+        fused[doc] = {
+            "score": score,
+            "vec_rank": vec_rank.get(doc),
+            "kw_rank": kw_rank.get(doc),
+            "best_rank": min(ranks) if ranks else 0,
+        }
+    return fused
+
+
 def normalize_rerank_result(result) -> list[tuple[int, float]]:
     """把各家 rerank 的返回统一成 [(index, score)]。
 
@@ -170,7 +272,12 @@ class Candidate:
     row: dict
     kw: float = 0.0
     vec: float | None = None
-    score: float = 0.0
+    score: float = 0.0   # 最终分（decay 加权后）
+    base: float = 0.0    # RRF 分（按本次最高分归一到 [0,1]）或 rerank 分
+    rrf: float = 0.0     # 原始 RRF 分（展示 / 调试用）
+    decay: float = 1.0   # 实际生效的衰减系数
+    vec_rank: int | None = None
+    kw_rank: int | None = None
     scored: bool = False
 
 
@@ -179,13 +286,11 @@ class RetrievalResult:
     rows: list[dict] = field(default_factory=list)
     mode: str = "keyword"
     notes: list[str] = field(default_factory=list)
+    fusion: str = ""  # 两路召回条数，例如「RRF：向量 5 + 关键词 3 → 6」
 
     @property
     def ok(self) -> bool:
         return bool(self.rows)
-
-
-# ── 检索器 ─────────────────────────────────────────────────────────────
 
 
 class Retriever:
@@ -208,6 +313,10 @@ class Retriever:
         recall_k: int = DEFAULT_RECALL_K,
         rerank_k: int = DEFAULT_RERANK_K,
         min_score: float = DEFAULT_MIN_SCORE,
+        rrf_k: int = DEFAULT_RRF_K,
+        agreement_bonus: float = DEFAULT_AGREEMENT_BONUS,
+        access_cap: int = DEFAULT_ACCESS_CAP,
+        protected_importance: float = DEFAULT_PROTECTED_IMPORTANCE,
         logger=None,
     ) -> None:
         self.store = store
@@ -220,6 +329,22 @@ class Retriever:
             self.min_score = float(min_score)
         except (TypeError, ValueError):
             self.min_score = DEFAULT_MIN_SCORE
+        try:
+            self.rrf_k = max(1, int(rrf_k))
+        except (TypeError, ValueError):
+            self.rrf_k = DEFAULT_RRF_K
+        try:
+            self.agreement_bonus = max(0.0, float(agreement_bonus))
+        except (TypeError, ValueError):
+            self.agreement_bonus = DEFAULT_AGREEMENT_BONUS
+        try:
+            self.access_cap = max(1, int(access_cap))
+        except (TypeError, ValueError):
+            self.access_cap = DEFAULT_ACCESS_CAP
+        try:
+            self.protected_importance = float(protected_importance)
+        except (TypeError, ValueError):
+            self.protected_importance = DEFAULT_PROTECTED_IMPORTANCE
         self.logger = logger
 
     # -- 日志：只 warning，绝不冒泡 --
@@ -261,7 +386,11 @@ class Retriever:
             self._note(notes, f"向量缓存写入失败（#{row['id']}）：{e}")
         return vec
 
-    async def search(self, query: str, *, limit: int | None = None) -> RetrievalResult:
+    async def search(self, query: str, *, limit: int | None = None, now=None) -> RetrievalResult:
+        """两路召回 → RRF 融合 → rerank → decay 加权 → 截断。
+
+        `now` 只在单测里注入假时钟；日常留空取系统时间。
+        """
         top = max(1, int(limit or self.rerank_k))
         notes: list[str] = []
         query = (query or "").strip()
@@ -284,10 +413,22 @@ class Retriever:
         for row in recent:
             pool.setdefault(row["id"], Candidate(row=row, kw=keyword_score(row, terms)))
 
+        # 过期剔除：plan（step）过 TTL 就不再参与检索。不物理删，export 仍能看到。
+        if pool:
+            before = len(pool)
+            pool = {
+                key: cand for key, cand in pool.items()
+                if not is_expired(
+                    cand.row, now=now, protected_importance=self.protected_importance
+                )
+            }
+            dropped = before - len(pool)
+            if dropped:
+                self._note(notes, f"跳过 {dropped} 条过期记忆（plan 过 TTL）")
         if not pool:
             return RetrievalResult([], "keyword", notes)
 
-        # ── 向量 ──────────────────────────────────────────────
+        # ── 向量打分 ──────────────────────────────────────────
         vector_ready = False
         query_vec: list[float] = []
         if self.embed is not None:
@@ -311,31 +452,43 @@ class Retriever:
                 vector_ready = False
                 self._note(notes, "没有任何一条能算出向量，整体退关键词")
 
-        # ── 打分 ──────────────────────────────────────────────
-        for cand in pool.values():
-            if vector_ready and cand.vec is not None:
-                cand.score = 0.75 * cand.vec + 0.25 * cand.kw
-            else:
-                cand.score = 0.15 * cand.kw
-            cand.scored = True
+        # ── 两路排名 → RRF ────────────────────────────────────
+        # 向量路：按余弦降序；噪声地板只对「关键词一个都没中」的候选生效，
+        # 避免库里任意一条都被当成「最相关」。
+        vec_ranked = [c for c in pool.values() if c.vec is not None]
+        vec_ranked.sort(key=lambda c: c.vec, reverse=True)
+        vec_ranked = [
+            c for c in vec_ranked if c.kw > 0 or (c.vec is not None and c.vec >= self.min_score)
+        ][: self.recall_k]
+        vec_ids = [int(c.row["id"]) for c in vec_ranked]
 
-        ranked = sorted(
-            pool.values(),
-            key=lambda c: (c.score, str(c.row.get("updated_at") or "")),
-            reverse=True,
-        )[: self.recall_k]
+        # 关键词路：BM25 式打分降序
+        bm25 = bm25_scores([c.row for c in pool.values()], terms)
+        kw_ranked = [c for c in pool.values() if bm25.get(int(c.row["id"]), 0.0) > 0.0]
+        kw_ranked.sort(key=lambda c: bm25[int(c.row["id"])], reverse=True)
+        kw_ranked = kw_ranked[: self.recall_k]
+        kw_ids = [int(c.row["id"]) for c in kw_ranked]
 
-        # 噪声地板：关键词一个都没中、向量相似度又低于 min_score → 不是「相关记忆」，丢掉。
-        # 不设这个的话，库里任何一条都会被当成「最相关」返回（实测 /mem search 月亮
-        # 会把「小满 也喜欢 看星星」当结果），比空手而归更糟。
-        # 阈值可配（min_score，默认 0.2）：调高 = 更严格，弱相关直接不给。
-        ranked = [
-            c
-            for c in ranked
-            if c.kw > 0 or (c.vec is not None and c.vec >= self.min_score)
-        ]
+        fused = rrf_fuse(
+            vec_ids, kw_ids, k=self.rrf_k, agreement_bonus=self.agreement_bonus
+        )
+        if not fused:
+            return RetrievalResult([], "keyword", notes)
 
-        # ── 重排 ──────────────────────────────────────────────
+        ordered = sorted(
+            fused.items(), key=lambda item: (-item[1]["score"], item[1]["best_rank"], item[0])
+        )
+        best_rrf = ordered[0][1]["score"] or 1.0
+        ranked: list[Candidate] = []
+        for doc_id, info in ordered[: self.recall_k]:
+            cand = pool[doc_id]
+            cand.rrf = info["score"]
+            cand.base = info["score"] / best_rrf  # 归一到 [0,1]，让 decay 加权有可比性
+            cand.vec_rank = info["vec_rank"]
+            cand.kw_rank = info["kw_rank"]
+            ranked.append(cand)
+
+        # ── 重排（在融合之后） ────────────────────────────────
         rerank_ready = False
         if self.rerank is not None and len(ranked) > 1:
             try:
@@ -345,20 +498,38 @@ class Retriever:
                 )
                 pairs = normalize_rerank_result(raw)
                 if pairs:
-                    ordered: list[Candidate] = []
+                    reordered: list[Candidate] = []
                     seen: set[int] = set()
                     for idx, score in sorted(pairs, key=lambda p: p[1], reverse=True):
                         if 0 <= idx < len(ranked) and idx not in seen:
                             cand = ranked[idx]
-                            cand.score = score
-                            ordered.append(cand)
+                            cand.base = float(score)
+                            reordered.append(cand)
                             seen.add(idx)
-                    ranked = ordered + [c for i, c in enumerate(ranked) if i not in seen]
+                    ranked = reordered + [c for i, c in enumerate(ranked) if i not in seen]
                     rerank_ready = True
                 else:
-                    self._note(notes, "rerank 返回空，保持原排序")
+                    self._note(notes, "rerank 返回空，保持 RRF 排序")
             except Exception as e:  # noqa: BLE001 超时 / 接口挂了都走这里
                 self._note(notes, f"rerank 不可用（{type(e).__name__}: {e}）")
+
+        # ── decay 加权 → 截断 ─────────────────────────────────
+        for cand in ranked:
+            cand.score, cand.decay = final_score(
+                cand.base,
+                cand.row,
+                now=now,
+                access_cap=self.access_cap,
+                protected_importance=self.protected_importance,
+            )
+        ranked.sort(
+            key=lambda c: (
+                c.score,
+                str(c.row.get("updated_at") or ""),
+                int(c.row.get("id") or 0),
+            ),
+            reverse=True,
+        )
 
         if vector_ready and rerank_ready:
             mode = "vector+rerank"
@@ -373,10 +544,19 @@ class Retriever:
         for cand in ranked:
             row = dict(cand.row)
             row["score"] = round(float(cand.score), 4)
+            row["decay"] = round(float(cand.decay), 4)
+            row["rrf"] = round(float(cand.rrf), 6)
             rows.append(row)
 
         # 输出前净化：同 (subject, predicate) 只留 updated_at 最新的一条。
-        # 同一条事实在多个 scope / 多次导入后可能有多条有效记录，一起返回会让模型
-        # 同时看到新旧两个值、还分不清哪个是现在的。
         rows = dedupe_rows(rows)[:top]
-        return RetrievalResult(rows, mode, notes)
+
+        # 访问强化：真正返回给用户的这几条才算「被命中」。
+        if rows:
+            try:
+                self.store.reinforce([int(r["id"]) for r in rows], now=now)
+            except Exception as e:  # noqa: BLE001 计数失败不影响检索
+                self._note(notes, f"访问计数更新失败：{e}")
+
+        fusion = f"RRF：向量 {len(vec_ids)} + 关键词 {len(kw_ids)} → {len(rows)}"
+        return RetrievalResult(rows, mode, notes, fusion)

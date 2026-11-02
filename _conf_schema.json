@@ -88,5 +88,65 @@
     "type": "list",
     "hint": "填群号，一行一个。群里任何人发写指令都放行。",
     "default": []
+  },
+  "default_mtype": {
+    "description": "默认记忆类型",
+    "type": "string",
+    "hint": "fact / preference / event / plan，默认 fact。写入时会被 --type 覆盖；命中「待办/明天/截止」等线索词自动判 plan。",
+    "default": "fact"
+  },
+  "ttl_fact": {
+    "description": "fact 类型 TTL（天）",
+    "type": "int",
+    "hint": "默认 3650 天（10 年）。exp 衰减，半衰期 = TTL/2。",
+    "default": 3650
+  },
+  "ttl_preference": {
+    "description": "preference 类型 TTL（天）",
+    "type": "int",
+    "hint": "默认 365 天。exp 衰减。",
+    "default": 365
+  },
+  "ttl_event": {
+    "description": "event 类型 TTL（天）",
+    "type": "int",
+    "hint": "默认 30 天。exp 衰减。",
+    "default": 30
+  },
+  "ttl_plan": {
+    "description": "plan 类型 TTL（天）",
+    "type": "int",
+    "hint": "默认 2 天，step 衰减：过期直接不参与检索（不物理删，export 仍能看到）。",
+    "default": 2
+  },
+  "rrf_k": {
+    "description": "RRF 融合参数 k",
+    "type": "int",
+    "hint": "默认 60（论文推荐）。越大越平滑，两路排名的影响越接近；调小 = 头部更集中。",
+    "default": 60
+  },
+  "agreement_bonus": {
+    "description": "两路共识加成",
+    "type": "float",
+    "hint": "默认 0.02。向量路和关键词路都命中、且名次接近时给这个上限的加成；0 = 关闭。",
+    "default": 0.02
+  },
+  "protected_importance": {
+    "description": "免衰减重要度阈值",
+    "type": "float",
+    "hint": "默认 0.9。importance ≥ 此值的记忆不衰减、也不会因 plan 过期被剔除。",
+    "default": 0.9
+  },
+  "access_cap": {
+    "description": "访问强化封顶次数",
+    "type": "int",
+    "hint": "默认 10。access_count 到 10 次后衰减不再变慢（防止老热点霸榜）。",
+    "default": 10
+  },
+  "access_halve": {
+    "description": "衰减回合的访问计数回落系数",
+    "type": "float",
+    "hint": "默认 0.5。每次衰减回合（每小时最多一次）access_count *= 0.5，让旧热点重新参与竞争。",
+    "default": 0.5
   }
 }

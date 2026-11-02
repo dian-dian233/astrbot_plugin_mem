@@ -25,6 +25,7 @@ import asyncio
 import json
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 
@@ -172,6 +173,31 @@ class FakeEmbedder:
         return self.dim
 
 
+class VectorEmbedder:
+    """按文本查表返回固定向量：用来精确构造余弦（测去重阈值 / 噪声地板边界）。
+
+    查不到就用 default 向量。比 FakeEmbedder 的字符直方图可控，能凑出「cos 正好 0.97」。
+    """
+
+    def __init__(self, table=None, default=(1.0, 0.0, 0.0), pid="fake-vec", model="fake-vec-v1"):
+        self.table = {str(k): [float(x) for x in v] for k, v in dict(table or {}).items()}
+        self.default = [float(x) for x in default]
+        self.model = model
+        self.provider_config = {"id": pid}
+        self.calls = 0
+        self.fail: Exception | None = None
+
+    async def get_embedding(self, text: str) -> list[float]:
+        self.calls += 1
+        if self.fail is not None:
+            raise self.fail
+        vec = self.table.get(str(text))
+        return list(vec) if vec is not None else list(self.default)
+
+    def get_dim(self) -> int:
+        return len(self.default)
+
+
 class FakeReranker:
     """按字符重合打分，模拟 rerank。"""
 
@@ -272,10 +298,10 @@ async def collect(agen) -> str:
 
 class Harness:
     def __init__(self, main_mod, tmp, *, db_name="mem.db", embed=True, rerank=True,
-                 allowed_users=("10001",), allowed_groups=(), allow_all=False,
+                 embedder=None, allowed_users=("10001",), allowed_groups=(), allow_all=False,
                  auto_inject_n=0, **conf_overrides):
         self.tmp = tmp
-        self.embedder = FakeEmbedder() if embed else None
+        self.embedder = embedder if embedder is not None else (FakeEmbedder() if embed else None)
         self.reranker = FakeReranker() if rerank else None
         self.ctx = FakeContext(self.embedder, self.reranker)
         self.conf = {
@@ -289,6 +315,12 @@ class Harness:
             "allow_all": allow_all,
             "allowed_users": list(allowed_users),
             "allowed_groups": list(allowed_groups),
+            # v0.2.0 新增（和 _conf_schema.json 默认值保持一致）
+            "max_value_len": 120,
+            "reject_narrative": True,
+            "dedupe_threshold": 0.95,
+            "min_score": 0.2,
+            "inject_char_cap": 600,
         }
         self.conf.update(conf_overrides)
         self.plugin = main_mod.MemPlugin(self.ctx, self.conf)
@@ -454,7 +486,9 @@ async def test_injection(main_mod, tmp, chk: Checker) -> None:
     chk.eq(req.system_prompt, "你是点点。", "auto_inject_n=0 → 一点记忆都不注入")
     chk.ok("auto_inject_n=0 → prompt 里没有记忆段", "长期记忆" not in req.system_prompt)
 
-    on = Harness(main_mod, tmp, db_name="inject_on.db", auto_inject_n=2)
+    on = Harness(main_mod, tmp, db_name="inject_on.db", auto_inject_n=2, max_value_len=500)
+    # ↑ max_value_len 显式放宽到 500：这条 302 字的值是历史数据形状，用来测注入裁剪
+    #   （v0.2.0 默认 120 字会直接拒写；导入/旧库仍可能有超长值）
     await on.cmd("mem add 点点 喜欢 看星星")
     await on.cmd("mem add 点点 口头禅 星星" + "雨" * 300)
     req2 = ProviderRequest(system_prompt="你是点点。")
@@ -572,6 +606,202 @@ async def test_export_import(main_mod, tmp, chk: Checker) -> None:
     chk.eq(h.store.stats()["active"], 1, "合并后仍只有 1 条有效")
 
 
+async def test_write_hygiene(main_mod, tmp, chk: Checker) -> None:
+    """写入降噪：限长 120 / 拒叙事体 / 归一化。"""
+    h = Harness(main_mod, tmp, db_name="hygiene.db")
+    r = await h.cmd("mem add 点点 键值 " + "星" * 121)
+    chk.ok("121 字拒写", "内容太长" in r and "≤120" in r, r)
+    r = await h.cmd("mem add 点点 键值 " + "星" * 120)
+    chk.ok("120 字通过", "已记住" in r, r)
+
+    r = await h.cmd("mem add 点点 聊天 我今天跟他聊了记忆")
+    chk.ok("叙事体「我今天…」拒写", "像日记" in r and "已记住" not in r, r)
+    r = await h.cmd("mem add 点点 存储 点点的记忆库在 sqlite")
+    chk.ok("判断句「点点的记忆库在 sqlite」放行", "已记住" in r, r)
+    chk.eq(h.store.stats()["active"], 2, "被拒的没落库（只留 120 字 + 判断句 2 条）")
+
+    chk.eq(
+        main_mod.normalize_text("  点点  住在\u3000friend-box "),
+        "点点 住在 friend-box",
+        "归一化：全角空格→半角、连续空白压一个、去首尾",
+    )
+    chk.eq(
+        main_mod.normalize_text("点点，住在 friend-box。"),
+        "点点，住在 friend-box。",
+        "归一化：中文标点不动",
+    )
+
+    r = await h.plugin.memory_add(FakeEvent(""), "  点点  ", "住在", " friend-box\u3000A ")
+    chk.ok("工具写入也归一化", "已记住" in r, r)
+    row = [x for x in h.store.active_rows() if x["predicate"] == "住在"][0]
+    chk.eq(row["subject"], "点点", "主语 strip 后落库")
+    chk.eq(row["value"], "friend-box A", "value 全角空格转半角后落库")
+
+
+async def test_write_dedupe(main_mod, tmp, chk: Checker) -> None:
+    """写入相似去重：同 scope + 同 subject，cos ≥ 0.95 走覆盖。"""
+    # cos([1,0,0], [0.97,0.243,0]) ≈ 0.97 ≥ 0.95；cos([1,0,0], [0.8,0.6,0]) = 0.8 < 0.95
+    emb = VectorEmbedder({
+        "点点的记忆库在 sqlite": [1.0, 0.0, 0.0],
+        "点点的记忆库跑 sqlite": [0.97, 0.243, 0.0],
+        "点点的记忆库在 mysql": [0.8, 0.6, 0.0],
+    })
+    h = Harness(main_mod, tmp, db_name="dedupe_w.db", embedder=emb, rerank=False)
+    r1 = await h.cmd("mem add 点点 存储 点点的记忆库在 sqlite")
+    chk.ok("第一条正常写入", "已记住" in r1, r1)
+    old_id = int(r1.split("#")[1].split(" ")[0])
+
+    r2 = await h.cmd("mem add 点点 位置 点点的记忆库跑 sqlite")
+    chk.ok("同主语 cos 0.97 → 覆盖（提示作废）", "已作废" in r2, r2)
+    chk.eq(h.store.stats()["active"], 1, "相似去重后只剩 1 条")
+    left = h.store.active_rows()[0]
+    chk.eq(left["value"], "点点的记忆库跑 sqlite", "留下的是新值")
+    old = h.store.get(old_id)
+    chk.ok(
+        "旧记录 valid_to + superseded_by 都填了",
+        bool(old.get("valid_to")) and int(old.get("superseded_by") or 0) == int(left["id"]),
+        str(old),
+    )
+
+    r3 = await h.cmd("mem add 点点 库 点点的记忆库在 mysql")
+    chk.ok("cos 0.8 < 0.95 → 不合并", "已作废" not in r3 and h.store.stats()["active"] == 2, r3)
+
+    no_emb = Harness(main_mod, tmp, db_name="dedupe_noemb.db", embed=False, rerank=False)
+    r = await no_emb.cmd("mem add 点点 喜欢 看星星")
+    chk.ok(
+        "没有 embedding provider → 写入照常（去重跳过）",
+        "已记住" in r and no_emb.store.stats()["active"] == 1,
+        r,
+    )
+
+    bad_emb = VectorEmbedder({})
+    bad_emb.fail = RuntimeError("HTTP 500 embedding down")
+    broken = Harness(main_mod, tmp, db_name="dedupe_broken.db", embedder=bad_emb, rerank=False)
+    r = await broken.cmd("mem add 点点 喜欢 看月亮")
+    chk.ok(
+        "embedding 挂了也不阻塞写入",
+        "已记住" in r and broken.store.stats()["active"] == 1,
+        r,
+    )
+
+    off = Harness(main_mod, tmp, db_name="dedupe_off.db", embedder=emb, rerank=False,
+                  dedupe_threshold=0)
+    await off.cmd("mem add 点点 存储 点点的记忆库在 sqlite")
+    r = await off.cmd("mem add 点点 位置 点点的记忆库跑 sqlite")
+    chk.ok("dedupe_threshold=0 → 关闭相似去重", "已作废" not in r, r)
+    chk.eq(off.store.stats()["active"], 2, "关闭后两条并存")
+
+    # 新值向量要回填缓存：否则同主语的 N 次写入会退化成 O(N²) 次 embedding 调用
+    emb2 = VectorEmbedder({
+        "版本甲": [1.0, 0.0, 0.0],
+        "版本乙": [0.0, 0.0, 1.0],
+        "版本丙": [0.0, 1.0, 0.0],
+    })
+    cache = Harness(main_mod, tmp, db_name="dedupe_cache.db", embedder=emb2, rerank=False)
+    for tag, val in (("甲", "版本甲"), ("乙", "版本乙"), ("丙", "版本丙")):
+        await cache.cmd(f"mem add 机器 第{tag}版 {val}")
+    chk.eq(emb2.calls, 3, "同主语写 3 条只调 3 次 embedding（旧值命中缓存）")
+
+
+async def test_search_hygiene(main_mod, tmp, chk: Checker) -> None:
+    """检索净化：(subject, predicate) 去重 + updated_at 展示 + 作废标注。"""
+    h = Harness(main_mod, tmp, db_name="search_clean.db", rerank=False)
+    ids = []
+    for scope, val in (("global", "版本一"), ("group:1", "版本二"), ("user:1", "版本三")):
+        ids.append(h.store.add(scope, "部署", "版本", val, source="test")["id"])
+    with sqlite3.connect(h.store.path) as conn:  # 同一秒写入时间戳会撞，手动拉开
+        conn.execute(
+            "UPDATE mem SET updated_at=? WHERE id=?", ("2099-01-01T00:00:00+08:00", ids[-1])
+        )
+
+    r = await h.cmd("mem search 版本")
+    chk.eq(r.count("#"), 1, "同 (主语,谓词) 三条历史 → 输出只 1 条")
+    chk.ok("留的是 updated_at 最新那条", "版本三" in r and "版本一" not in r, r)
+    chk.ok("结果带更新时间", "更新 2099-01-01 00:00" in r, r)
+    chk.ok(
+        "作废记录标注「已作废」",
+        "已作废" in main_mod.format_row(
+            {"id": 9, "scope": "global", "subject": "a", "predicate": "b", "value": "c",
+             "valid_to": "2026-01-01T00:00:00+08:00", "updated_at": "2026-01-01T00:00:00+08:00"}
+        ),
+    )
+
+
+async def test_min_score(main_mod, tmp, chk: Checker) -> None:
+    """噪声地板可配：min_score=0.9 时弱相关被滤掉。"""
+    emb = VectorEmbedder({
+        "月亮": [1.0, 0.0, 0.0],
+        "小满 也喜欢 看星星": [0.3, 0.954, 0.0],  # 余弦 0.3：关键词一个没中
+    })
+    loose = Harness(main_mod, tmp, db_name="minscore.db", embedder=emb, rerank=False)
+    await loose.cmd("mem add 小满 也喜欢 看星星")
+    r = await loose.cmd("mem search 月亮")
+    chk.ok("min_score=0.2 → 余弦 0.3 的弱相关还留着", "看星星" in r, r)
+
+    strict = Harness(main_mod, tmp, db_name="minscore.db", embedder=emb, rerank=False,
+                     min_score=0.9)
+    r = await strict.cmd("mem search 月亮")
+    chk.ok("min_score=0.9 → 弱相关被滤掉", "没检索到" in r, r)
+
+
+async def test_dedupe_cmd(main_mod, tmp, chk: Checker) -> None:
+    """/mem dedupe [--dry-run]：扫全库同槽重复。"""
+    h = Harness(main_mod, tmp, db_name="dedupe_cmd.db", rerank=False)
+    path = h.store.path
+    with sqlite3.connect(path) as conn:  # 直接造 v0.1.0 遗留的同槽重复（add 本身不会重复）
+        for val, ts in (
+            ("旧甲", "2026-01-01T00:00:00+08:00"),
+            ("旧乙", "2026-02-01T00:00:00+08:00"),
+            ("新丙", "2026-03-01T00:00:00+08:00"),
+        ):
+            conn.execute(
+                "INSERT INTO mem(scope,subject,predicate,value,confidence,source,"
+                "created_at,updated_at,valid_from) VALUES(?,?,?,?,?,?,?,?,?)",
+                ("global", "服务器", "系统", val, 0.8, "test", ts, ts, ts),
+            )
+    chk.eq(h.store.stats()["active"], 3, "先造 3 条同槽重复")
+
+    r = await h.cmd("mem dedupe --dry-run")
+    chk.ok("--dry-run 报告「扫描 3 条，可合并 1 组」", "扫描 3 条，可合并 1 组" in r, r)
+    chk.ok("--dry-run 明说没改库", "dry-run）没改库" in r, r)
+    chk.eq(h.store.stats()["active"], 3, "--dry-run 不改库")
+
+    r = await h.cmd("mem dedupe")
+    chk.ok("真跑：作废 2 条", "已作废 2 条" in r, r)
+    chk.eq(h.store.stats()["active"], 1, "真跑后只剩 1 条有效")
+    chk.eq(h.store.active_rows()[0]["value"], "新丙", "保留 updated_at 最新的那条")
+
+    r = await h.cmd("mem dedupe")
+    chk.ok("再跑一次：无可合并", "可合并 0 组" in r, r)
+    r = await h.cmd("mem dedupe --oops")
+    chk.ok("不认识参数 → 友好报错", "不认识的参数" in r and "Traceback" not in r, r)
+
+
+async def test_inject_cap(main_mod, tmp, chk: Checker) -> None:
+    """注入：按 subject 去重 + inject_char_cap 按 updated_at 倒序砍。"""
+    from astrbot.api.provider import ProviderRequest
+
+    h = Harness(main_mod, tmp, db_name="inject_cap.db", auto_inject_n=5,
+                inject_char_cap=120, rerank=False)
+    await h.cmd("mem add 甲机 状态 星" + "A" * 100)
+    await h.cmd("mem add 乙机 状态 星" + "B" * 100)
+    req = ProviderRequest(system_prompt="你是点点。")
+    await h.plugin.inject_memory(FakeEvent("星"), req)
+    chk.ok("超 inject_char_cap → 丢掉较旧的那条", "A" * 20 not in req.system_prompt,
+           req.system_prompt)
+    chk.ok("最新的那条保留", "B" * 20 in req.system_prompt, req.system_prompt)
+
+    by_subject = Harness(main_mod, tmp, db_name="inject_subj.db", auto_inject_n=3, rerank=False)
+    await by_subject.cmd("mem add 点点 喜欢 看星星")
+    await by_subject.cmd("mem add 点点 讨厌 下雨")
+    await by_subject.cmd("mem add 小满 喜欢 看月亮")
+    req2 = ProviderRequest(system_prompt="你是点点。")
+    await by_subject.plugin.inject_memory(FakeEvent("喜欢"), req2)
+    block = req2.system_prompt.split("[长期记忆")[-1]
+    chk.eq(block.count("- "), 2, "注入按 subject 去重：同主语只留 1 条")
+    chk.ok("另一个主语照常注入", "小满" in block, block)
+
+
 async def test_db_path(main_mod, tmp, chk: Checker) -> None:
     store = main_mod.resolve_db_path
     data_dir = os.path.join(tmp, "astrbot_data")
@@ -616,6 +846,12 @@ async def run_all() -> int:
         await test_llm_tools(main_mod, tmp_root, chk)
         await test_vector_cache(main_mod, tmp_root, chk)
         await test_export_import(main_mod, tmp_root, chk)
+        await test_write_hygiene(main_mod, tmp_root, chk)
+        await test_write_dedupe(main_mod, tmp_root, chk)
+        await test_search_hygiene(main_mod, tmp_root, chk)
+        await test_min_score(main_mod, tmp_root, chk)
+        await test_dedupe_cmd(main_mod, tmp_root, chk)
+        await test_inject_cap(main_mod, tmp_root, chk)
         await test_db_path(main_mod, tmp_root, chk)
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)

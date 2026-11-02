@@ -26,12 +26,14 @@ import asyncio
 import hashlib
 import math
 from dataclasses import dataclass, field
+from datetime import datetime
 
 DEFAULT_RECALL_K = 30
 DEFAULT_RERANK_K = 5
 EMBED_TIMEOUT = 15.0  # 秒；embedding 调用超时即降级
 RERANK_TIMEOUT = 20.0  # 秒；rerank 调用超时即降级
-MIN_VECTOR_SCORE = 0.2  # 一个关键词都没命中的纯向量候选，余弦低于这个值就丢掉（防噪声）
+DEFAULT_MIN_SCORE = 0.2  # 噪声地板默认值（可用配置 min_score 覆盖）
+MIN_VECTOR_SCORE = DEFAULT_MIN_SCORE  # 兼容旧引用；实际取 Retriever.min_score
 
 
 # ── 纯函数工具（单测直接用） ───────────────────────────────────────────
@@ -41,6 +43,48 @@ def text_hash(subject: str, predicate: str, value: str) -> str:
     """内容哈希：向量缓存的校验键。"""
     raw = f"{subject}|{predicate}|{value}".encode()
     return hashlib.sha256(raw).hexdigest()
+
+
+def value_hash(value: str) -> str:
+    """只对 value 做哈希：写入相似去重用的是「纯 value 向量」，缓存键要和它对齐。"""
+    return hashlib.sha256(f"value:{value}".encode()).hexdigest()
+
+
+def _ts(value) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def newer(left, right) -> bool:
+    """left 是否比 right 新（ISO 串解析失败就退回字符串比较）。"""
+    a, b = _ts(left), _ts(right)
+    if a is not None and b is not None:
+        return a > b
+    return str(left or "") > str(right or "")
+
+
+def dedupe_rows(rows: list[dict], *, key=None) -> list[dict]:
+    """按 key 分组，每组只留 `updated_at` 最新的一条；位置取组内首次出现处。
+
+    默认按 `(subject, predicate)` 分组 —— 检索输出前用它，防止同一条事实的历史版本
+    一起返回。注入时传 `key=lambda r: r["subject"]` 就是按主语去重。
+    """
+    if key is None:
+        def key(row: dict):
+            return (str(row.get("subject") or ""), str(row.get("predicate") or ""))
+
+    best: dict = {}
+    order: list = []
+    for row in rows or []:
+        slot = key(row)
+        if slot not in best:
+            best[slot] = row
+            order.append(slot)
+        elif newer(row.get("updated_at"), best[slot].get("updated_at")):
+            best[slot] = row
+    return [best[slot] for slot in order]
 
 
 def pack_vec(vec: list[float]) -> bytes:
@@ -163,6 +207,7 @@ class Retriever:
         model_key: str = "",
         recall_k: int = DEFAULT_RECALL_K,
         rerank_k: int = DEFAULT_RERANK_K,
+        min_score: float = DEFAULT_MIN_SCORE,
         logger=None,
     ) -> None:
         self.store = store
@@ -171,6 +216,10 @@ class Retriever:
         self.model_key = model_key or "default"
         self.recall_k = max(1, int(recall_k or DEFAULT_RECALL_K))
         self.rerank_k = max(1, int(rerank_k or DEFAULT_RERANK_K))
+        try:
+            self.min_score = float(min_score)
+        except (TypeError, ValueError):
+            self.min_score = DEFAULT_MIN_SCORE
         self.logger = logger
 
     # -- 日志：只 warning，绝不冒泡 --
@@ -276,13 +325,14 @@ class Retriever:
             reverse=True,
         )[: self.recall_k]
 
-        # 噪声地板：关键词一个都没中、向量相似度又低于阈值 → 不是「相关记忆」，丢掉。
+        # 噪声地板：关键词一个都没中、向量相似度又低于 min_score → 不是「相关记忆」，丢掉。
         # 不设这个的话，库里任何一条都会被当成「最相关」返回（实测 /mem search 月亮
         # 会把「小满 也喜欢 看星星」当结果），比空手而归更糟。
+        # 阈值可配（min_score，默认 0.2）：调高 = 更严格，弱相关直接不给。
         ranked = [
             c
             for c in ranked
-            if c.kw > 0 or (c.vec is not None and c.vec >= MIN_VECTOR_SCORE)
+            if c.kw > 0 or (c.vec is not None and c.vec >= self.min_score)
         ]
 
         # ── 重排 ──────────────────────────────────────────────
@@ -320,8 +370,13 @@ class Retriever:
             mode = "keyword"
 
         rows = []
-        for cand in ranked[:top]:
+        for cand in ranked:
             row = dict(cand.row)
             row["score"] = round(float(cand.score), 4)
             rows.append(row)
+
+        # 输出前净化：同 (subject, predicate) 只留 updated_at 最新的一条。
+        # 同一条事实在多个 scope / 多次导入后可能有多条有效记录，一起返回会让模型
+        # 同时看到新旧两个值、还分不清哪个是现在的。
+        rows = dedupe_rows(rows)[:top]
         return RetrievalResult(rows, mode, notes)

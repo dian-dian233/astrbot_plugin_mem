@@ -328,6 +328,9 @@
         <option value="subject_asc">主语 A→Z</option>
       </select>
     </div>
+    <button class="btn" id="btnDedupe" title="同一主语+谓词只保留最新">合并重复</button>
+    <button class="btn" id="btnConsolidate" title="同一主语且语义相近的多条合并">语义整合</button>
+    <label class="btn" style="cursor:pointer;gap:6px" title="只统计不写库"><input type="checkbox" id="dry-run" checked style="height:13px;width:13px;min-width:0;cursor:pointer" />dry-run</label>
     <button class="btn ghost" id="btnReset">重置</button>
     <div class="spacer"></div>
     <div class="field">
@@ -339,6 +342,7 @@
     </div>
   </div>
 
+  <div id="error" role="alert" hidden style="margin-bottom:12px;padding:10px 14px;border:1px solid #EBD3D0;background:#FDF7F6;color:#8C3A32;border-radius:8px;font-size:12.5px"></div>
   <section class="panel">
     <div class="panel-head">
       <h2>记忆列表<span class="sub" id="listSub">—</span></h2>
@@ -522,6 +526,23 @@
     } catch (e) { return safe; }
   }
 
+  function showError(msg) {
+    var el = $("error");
+    el.textContent = String(msg || "请求失败");
+    el.hidden = false;
+  }
+  function hideError() { var el = $("error"); el.hidden = true; el.textContent = ""; }
+
+  async function maintenance(kind) {
+    var dry = $("dry-run").checked;
+    try {
+      var d = await api("/" + kind, { method: "POST", body: JSON.stringify({ dry_run: dry }) });
+      var msg = (d && (d.message || d.summary)) || "完成";
+      toast((dry ? "[dry] " : "") + kind + "：" + msg);
+      if (!dry) { loadList(); loadStats(); }
+    } catch (e) { toast(kind + " 失败：" + e.message, true); }
+  }
+
   /* ── 概览 ─────────────────────────────── */
   async function loadStats() {
     try {
@@ -625,6 +646,7 @@
       var qs = "?limit=" + state.limit + "&offset=" + state.offset +
         "&q=" + encodeURIComponent(state.q) + "&type=" + encodeURIComponent(state.type);
       var d = await api("/list" + qs);
+      hideError();
       state.items = d.items || [];
       state.total = d.total || 0;
       renderRows(state.items);
@@ -638,6 +660,7 @@
     } catch (e) {
       $("tbody").innerHTML = "";
       stateBlock("加载失败", e.message, true);
+      showError("列表加载失败：" + e.message);
       toast("列表加载失败：" + e.message, true);
     } finally {
       state.loading = false;
@@ -750,6 +773,20 @@
       ctx.fillStyle = TYPE_COLOR[n.mtype] || "#9AA0A8";
       ctx.fill();
     });
+
+    cv.onmousemove = function (ev) {
+      var rect = cv.getBoundingClientRect();
+      var mx = ev.clientX - rect.left, my = ev.clientY - rect.top;
+      var best = null, bestD = 12;
+      nodes.forEach(function (n) {
+        var p = pos[n.id]; if (!p) return;
+        var dd = Math.hypot(p.x - mx, p.y - my);
+        if (dd < bestD) { bestD = dd; best = n; }
+      });
+      $("graphNote").textContent = best
+        ? ((best.subject || "") + " · " + String(best.value || "").slice(0, 60))
+        : (nodes.length + " 个节点。同一个主语的记忆连成一簇，节点大小按重要程度。");
+    };
 
     keys.forEach(function (k, i) {
       var a = (i / Math.max(keys.length, 1)) * Math.PI * 2 - Math.PI / 2;

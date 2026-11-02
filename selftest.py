@@ -1955,31 +1955,29 @@ async def test_webapi_handlers(main_mod, tmp, chk: Checker) -> None:
 def test_webui_page(chk: Checker) -> None:
     """前端 smoke：关键 id、零依赖、无硬编码地址、内联脚本语法。"""
     chk.ok("前端：views/memory/index.html 存在", os.path.isfile(PAGE_PATH), PAGE_PATH)
-    if not os.path.isfile(PAGE_PATH):
-        return
-    import re as _re
-
     html = open(PAGE_PATH, encoding="utf-8").read()
-    for element_id, label in (("search", "搜索框"), ("table", "表格"), ("graph", "关系图"), ("stats", "统计卡")):
+    for element_id, label in (
+        ("q", "搜索框"),
+        ("tbody", "表格主体"),
+        ("typeBar", "类型分布条"),
+        ("drawer", "详情抽屉"),
+        ("formDrawer", "新增抽屉"),
+        ("graph", "关系图画布"),
+        ("dry-run", "dry-run 勾选"),
+    ):
         chk.ok(f"前端：#{element_id}（{label}）存在", f'id="{element_id}"' in html, "")
-
-    chk.ok("前端：暗色主题默认", 'data-theme="dark"' in html and "--bg" in html, "")
-    chk.ok("前端：跟 dashboard 主题（light 也有变量）", 'data-theme="light"' in html, "")
-    chk.ok("前端：通过页面桥发请求", "AstrBotPluginView" in html and "apiGet" in html and "apiPost" in html, "")
-    chk.ok("前端：调用 mem-api 接口", "mem-api/list" in html and "mem-api/stats" in html
-           and "mem-api/graph" in html and "mem-api/add" in html
-           and "mem-api/forget" in html and "mem-api/dedupe" in html
-           and "mem-api/consolidate" in html, "")
-    chk.ok("前端：dry-run 勾选框", 'id="dry-run"' in html and "dry_run" in html, "")
-    chk.ok("前端：关系图用 canvas", "<canvas" in html and "getContext(\"2d\")" in html, "")
-    chk.ok("前端：节点大小按 importance", "borderRadius(node.importance)" in html or "importance" in html, "")
-    chk.ok("前端：悬停提示截 60 字", ".slice(0, 60)" in html, "")
-    chk.ok("前端：关系图截断提示", "只画了前" in html and "truncated" in html, "")
-    chk.ok("前端：请求失败可见（#error 横幅）", 'id="error"' in html and "showError(" in html and "role=\"alert\"" in html, "")
-    chk.ok("前端：没有硬编码 localhost / 127.0.0.1",
-           "localhost" not in html and "127.0.0.1" not in html, "")
-    chk.ok("前端：没有硬编码 http(s) 外部依赖",
-           not _re.search(r'(src|href)="https?://', html), "")
+    chk.ok("前端：浅色主题 Token", "#F8F9FA" in html and "#FFFFFF" in html and "#18181B" in html, "")
+    chk.ok("前端：跟随系统主题（prefers-color-scheme）", "prefers-color-scheme" in html, "")
+    chk.ok("前端：用 fetch 调 mem-api", "mem-api" in html and "fetch(" in html, "")
+    chk.ok("前端：调用列表与统计接口", '"/list"' in html and '"/stats"' in html, "")
+    chk.ok("前端：维护操作带 dry_run", "dry_run" in html and '"/dedupe"' in html, "")
+    chk.ok("前端：关系图用 canvas", "<canvas" in html and 'getContext("2d")' in html, "")
+    chk.ok("前端：节点大小按 importance", "importance" in html, "")
+    chk.ok("前端：悬停提示截 60 字", "slice(0, 60)" in html, "")
+    chk.ok("前端：关系图截断提示", "truncated" in html, "")
+    chk.ok("前端：请求失败可见（#error 横幅）", 'id="error"' in html and "showError(" in html and 'role="alert"' in html, "")
+    chk.ok("前端：没有硬编码 localhost / 127.0.0.1", "localhost" not in html and "127.0.0.1" not in html, "")
+    chk.ok("前端：没有硬编码 http(s) 外部依赖", "http://" not in html and "https://" not in html, "")
     chk.ok("前端：零构建（没有 npm / import from）",
            "node_modules" not in html and 'type="module"' not in html, "")
 

@@ -895,6 +895,8 @@
   $("fType").onchange = function (ev) { state.type = ev.target.value; state.offset = 0; loadList(); };
   $("fSort").onchange = function (ev) { state.sort = ev.target.value; renderRows(state.items); };
   $("fLimit").onchange = function (ev) { state.limit = Number(ev.target.value) || 20; state.offset = 0; loadList(); };
+  $("btnDedupe").onclick = function () { maintenance("dedupe"); };
+  $("btnConsolidate").onclick = function () { maintenance("consolidate"); };
   $("btnReset").onclick = function () {
     state.q = ""; state.type = ""; state.sort = "updated_desc"; state.offset = 0;
     $("q").value = ""; $("fType").value = ""; $("fSort").value = "updated_desc";

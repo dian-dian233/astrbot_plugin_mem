@@ -99,6 +99,12 @@
   .field::after{content:"";position:absolute;right:11px;top:50%;width:5px;height:5px;
     border-right:1px solid var(--text-3);border-bottom:1px solid var(--text-3);
     transform:translateY(-70%) rotate(45deg);pointer-events:none}
+  /* 会话下拉：限定宽度，长 umo 省略，避免把工具栏挤成两行 */
+  .field-session{flex:0 1 168px;min-width:126px;max-width:186px}
+  .field-session select{width:100%;text-overflow:ellipsis;white-space:nowrap;overflow:hidden}
+  /* 窄屏：隐藏只有「有效记忆」一个选项的占位筛选；再窄就横向滚动，仍然只有一行 */
+  @media (max-width:1260px){ .toolbar .field-status{display:none} }
+  @media (max-width:1160px){ .toolbar{flex-wrap:nowrap;overflow-x:auto;scrollbar-width:thin} }
   .spacer{flex:1}
 
   /* ── 列表 ───────────────────────────── */
@@ -306,6 +312,11 @@
            stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
       <input id="q" placeholder="搜索主语 / 谓词 / 内容，回车执行" autocomplete="off" />
     </div>
+    <div class="field field-session">
+      <select class="field" id="fOrigin" aria-label="会话筛选" title="按写入这条记忆的会话筛选">
+        <option value="">全部会话</option>
+      </select>
+    </div>
     <div class="field">
       <select class="field" id="fType" aria-label="类型筛选">
         <option value="">全部类型</option>
@@ -315,7 +326,7 @@
         <option value="preference">Preference</option>
       </select>
     </div>
-    <div class="field">
+    <div class="field field-status">
       <select class="field" id="fStatus" aria-label="状态筛选" disabled
               title="当前接口只返回有效记忆，已作废记录仅在「已作废」统计中体现">
         <option value="active">有效记忆</option>
@@ -455,7 +466,7 @@
   var TYPE_LABEL = { fact: "Fact", event: "Event", plan: "Plan", preference: "Preference" };
   var TYPE_COLOR = { fact: "#64748B", event: "#5B7F6B", plan: "#A9814A", preference: "#7A6E86" };
 
-  var state = { q: "", type: "", sort: "updated_desc", limit: 20, offset: 0, total: 0, items: [], loading: false, view: "table" };
+  var state = { q: "", type: "", origin: "", sort: "updated_desc", limit: 20, offset: 0, total: 0, items: [], loading: false, view: "table" };
   var current = null;
 
   function $(id) { return document.getElementById(id); }
@@ -603,6 +614,28 @@
     }
   }
 
+  /* ── 会话下拉（v0.8.0） ──────────────── */
+  async function loadSessions() {
+    try {
+      var d = await api(ACT + "sessions");
+      var items = (d && d.items) || [];
+      var sel = $("fOrigin");
+      var current = state.origin;
+      var opts = ['<option value="">全部会话</option>'];
+      items.forEach(function (it) {
+        var label = (it.label || it.origin || "未记录来源") + "（" + (it.count || 0) + "）";
+        opts.push('<option value="' + esc(it.origin || "") + '">' + esc(label) + "</option>");
+      });
+      sel.innerHTML = opts.join("");
+      sel.value = current;
+      if (sel.value !== current) { state.origin = ""; sel.value = ""; }
+    } catch (e) {
+      // 下拉只是筛选器：拿不到就保持「全部会话」，不影响主列表
+      $("fOrigin").innerHTML = '<option value="">全部会话</option>';
+      state.origin = "";
+    }
+  }
+
   /* ── 列表 ─────────────────────────────── */
   function skeleton() {
     var rows = "";
@@ -637,7 +670,7 @@
 
   function renderRows(items) {
     if (!items.length) {
-      if (state.q) stateBlock("没有匹配的记忆", "换个关键词，或清空搜索条件再看看", false);
+      if (state.q || state.origin) stateBlock("没有匹配的记忆", "换个关键词 / 会话，或清空筛选条件再看看", false);
       else stateBlock("还没有记忆", "点右上角「新增记忆」写第一条，或用 /mem add 指令", false);
       return;
     }
@@ -664,7 +697,8 @@
     skeleton();
     try {
       var d = await api(ACT + "list", { params: {
-        limit: state.limit, offset: state.offset, q: state.q, type: state.type } });
+        limit: state.limit, offset: state.offset, q: state.q, type: state.type,
+        origin: state.origin } });
       hideError();
       state.items = d.items || [];
       state.total = d.total || 0;
@@ -710,6 +744,7 @@
       '<div><div class="k">重要程度</div><div class="v">' + (Number(it.importance) || 0).toFixed(3) + "</div></div>" +
       '<div><div class="k">记忆 ID</div><div class="v">#' + it.id + "</div></div>" +
       '<div><div class="k">作用域</div><div class="v">' + esc(it.scope || "global") + "</div></div>" +
+      '<div><div class="k">来源会话</div><div class="v">' + esc(it.origin || "未记录") + "</div></div>" +
       '<div><div class="k">创建时间</div><div class="v">' + esc(exactTime(it.created_at) || "—") + "</div></div>" +
       '<div><div class="k">更新时间</div><div class="v">' + esc(exactTime(it.updated_at) || "—") + "</div></div>" +
       (it.source ? '<div><div class="k">来源</div><div class="v">' + esc(it.source) + "</div></div>" : "") +
@@ -841,7 +876,7 @@
       $("aSubject").value = ""; $("aPredicate").value = ""; $("aValue").value = "";
       closeDrawers();
       state.offset = 0;
-      loadList(); loadStats(); loadGraph();
+      loadList(); loadStats(); loadSessions(); loadGraph();
     } catch (e) {
       setErr($("aValue"), e.message);
     } finally {
@@ -910,16 +945,20 @@
     if (ev.key === "Enter") { clearTimeout(qTimer); state.q = ev.target.value.trim(); state.offset = 0; loadList(); }
   });
   $("fType").onchange = function (ev) { state.type = ev.target.value; state.offset = 0; loadList(); };
+  $("fOrigin").onchange = function (ev) { state.origin = ev.target.value; state.offset = 0; loadList(); };
   $("fSort").onchange = function (ev) { state.sort = ev.target.value; renderRows(state.items); };
   $("fLimit").onchange = function (ev) { state.limit = Number(ev.target.value) || 20; state.offset = 0; loadList(); };
   $("btnDedupe").onclick = function () { maintenance("dedupe"); };
   $("btnConsolidate").onclick = function () { maintenance("consolidate"); };
   $("btnReset").onclick = function () {
-    state.q = ""; state.type = ""; state.sort = "updated_desc"; state.offset = 0;
-    $("q").value = ""; $("fType").value = ""; $("fSort").value = "updated_desc";
+    state.q = ""; state.type = ""; state.origin = ""; state.sort = "updated_desc"; state.offset = 0;
+    $("q").value = ""; $("fType").value = ""; $("fOrigin").value = ""; $("fSort").value = "updated_desc";
     loadList();
   };
-  $("btnRefresh").onclick = function () { loadStats(); loadList(); if (state.view === "graph") loadGraph(); };
+  $("btnRefresh").onclick = function () {
+    loadStats(); loadSessions(); loadList();
+    if (state.view === "graph") loadGraph();
+  };
   $("prevPage").onclick = function () { state.offset = Math.max(0, state.offset - state.limit); loadList(); };
   $("nextPage").onclick = function () { state.offset += state.limit; loadList(); };
 
@@ -939,6 +978,7 @@
   window.addEventListener("resize", function () { if (state.view === "graph") drawGraph(); });
 
   loadStats();
+  loadSessions();
   loadList();
 })();
 </script>

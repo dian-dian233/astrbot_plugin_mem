@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.db
+mem.db*
+spill/
+.DS_Store

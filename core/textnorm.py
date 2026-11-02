@@ -1,6 +1,6 @@
 """文本归一化：**纯标准库，不 import astrbot**。
 
-拆出来单独一个模块，是因为 `main.py`（有 astrbot 依赖）和 `livingmemory.py`（要能脱离
+拆出来单独一个模块，是因为 `main.py`（有 astrbot 依赖）和 `core/livingmemory.py`（要能脱离
 框架直接跑）都要用同一份归一化规则 —— 两边各抄一份迟早会漂。
 
 规则和 v0.2.0 完全一致：

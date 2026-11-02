@@ -50,7 +50,9 @@ from .lifecycle import (
 )
 
 DEFAULT_DB_NAME = "mem.db"
-PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+# 本文件在 <插件根>/core/ 下，往上退一层才是插件目录；
+# 这个值用于「db_path 不许落在插件代码目录」的拦截和 data 目录反推，退错一层会静默失效。
+PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS mem(

@@ -11,7 +11,7 @@ RRF：score = Σ 1/(rrf_k + rank)，`rrf_k` 默认 60；两路都命中且名次
 `agreement_bonus`（默认 0.02，按名次差线性衰减）。某一路为空就只用另一路，
 不拿空路稀释（空路没有 rank，自然不贡献分数）。
 
-降权：`final = base * decay * (0.5 + 0.5 * importance)`，decay 见 lifecycle.py。
+降权：`final = base * decay * (0.5 + 0.5 * importance)`，decay 见 core/lifecycle.py。
 plan（step）过 TTL 直接剔除，不参与融合。
 
 向量缓存：vec 表按 (mem_id, model) 存 float32；同一 model 下内容哈希没变就不重复

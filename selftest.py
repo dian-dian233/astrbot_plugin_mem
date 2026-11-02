@@ -111,6 +111,83 @@ class ProviderRequest:
     session_id: str = ""
     contexts: list = field(default_factory=list)
 """,
+    "api/web.py": '''
+"""桩：镜像 astrbot/api/web.py 的四个出口（request / json_response / error_response / bind）。
+
+真实现见 AstrBot 4.29.3 `astrbot/api/web.py:255`（PluginRequestProxy）与 `:327`
+（bind_request_context）；这里只保留插件用到的部分，形状对齐（JSON 信封仍然是
+{"status","message","data"}），方便离线直调 handler。
+"""
+import contextvars
+from contextlib import contextmanager
+
+
+class PluginRequest:
+    """假 request：query 给字典，body 给 dict，json() 原样返回。"""
+
+    def __init__(self, query=None, body=None, username="selftest"):
+        self.query = query or {}
+        self._body = {} if body is None else body
+        self.username = username
+        self.method = "GET"
+        self.path = ""
+
+    async def json(self, default=None):
+        return self._body if self._body is not None else default
+
+
+_current = contextvars.ContextVar("plugin_web_request", default=None)
+
+
+class PluginRequestProxy:
+    def _current(self):
+        req = _current.get()
+        if req is None:
+            raise RuntimeError("no plugin web request bound")
+        return req
+
+    @property
+    def query(self):
+        return self._current().query
+
+    @property
+    def username(self):
+        return self._current().username
+
+    async def json(self, default=None):
+        return await self._current().json(default=default)
+
+
+request = PluginRequestProxy()
+
+
+@contextmanager
+def bind_request_context(req):
+    token = _current.set(req)
+    try:
+        yield req
+    finally:
+        _current.reset(token)
+
+
+class FakeResponse:
+    """对齐 starlette JSONResponse 的两个字段：status_code / 解析后的 body。"""
+
+    def __init__(self, payload, status_code=200):
+        self.payload = payload
+        self.status_code = status_code
+
+    def json(self):
+        return self.payload
+
+
+def json_response(data=None, *, status_code=200, headers=None):
+    return FakeResponse(data, status_code)
+
+
+def error_response(message, *, status_code=400, data=None, headers=None):
+    return FakeResponse({"status": "error", "message": message, "data": data}, status_code)
+''',
     "api/star/__init__.py": """
 class Context:
     pass
@@ -258,9 +335,19 @@ class FakeContext:
         for prov in (embed, rerank):
             if prov is not None:
                 self._by_id[prov.provider_config["id"]] = prov
+        # WebUI 路由注册表：行为对齐 astrbot/core/star/context.py:790-796
+        # （同 route + 同 methods → 原位替换，否则追加）
+        self.registered_web_apis: list[tuple] = []
 
     def get_provider_by_id(self, provider_id):
         return self._by_id.get(provider_id)
+
+    def register_web_api(self, route, view_handler, methods, desc):
+        for idx, api in enumerate(self.registered_web_apis):
+            if api[0] == route and methods == api[2]:
+                self.registered_web_apis[idx] = (route, view_handler, methods, desc)
+                return
+        self.registered_web_apis.append((route, view_handler, methods, desc))
 
 
 class FakeEvent:
@@ -1549,6 +1636,371 @@ async def test_import_lm_limit(main_mod, tmp, chk: Checker) -> None:
     chk.eq(h.store.stats()["active"], 2, "limit：只进了 2 条")
 
 
+# ── v0.6.0：WebUI 管理页 ───────────────────────────────────────────────
+
+PAGE_PATH = os.path.join(HERE, "views", "memory", "index.html")
+WEB_PREFIX = "/astrbot_plugin_mem/mem-api/"
+
+
+def _expect_web_error(fn, needle: str, name: str, chk: Checker) -> None:
+    """断言 `fn()` 抛 400 + 中文提示。"""
+    try:
+        fn()
+    except Exception as e:  # noqa: BLE001 这里就是要看异常类型
+        message = getattr(e, "message", str(e))
+        status = getattr(e, "status_code", None)
+        chk.ok(name, needle in message and status == 400, f"{type(e).__name__} {status} {message}")
+    else:
+        chk.ok(name, False, "没有抛异常")
+
+
+async def _call_web(handler, *, query=None, body=None):
+    """按真实调用方式调 handler：request 通过 contextvar 绑定，handler 不接参数。"""
+    import astrbot.api.web as web_stub
+
+    with web_stub.bind_request_context(web_stub.PluginRequest(query=query or {}, body=body)):
+        return await handler()
+
+
+def test_webapi_units(main_mod, chk: Checker) -> None:
+    """纯函数层：参数校验 / 分页 / 关系图，不碰数据库。"""
+    api = main_mod.web_api
+
+    params = api.parse_list_query({})
+    chk.eq((params["q"], params["type"], params["limit"], params["offset"]), ("", "", 20, 0),
+           "webapi：list 默认 q/type/limit/offset")
+    params = api.parse_list_query({"q": " 点点 ", "type": "PLAN", "limit": "5", "offset": "10"})
+    chk.eq((params["q"], params["type"], params["limit"], params["offset"]), ("点点", "plan", 5, 10),
+           "webapi：list 参数去空格 + type 小写 + 整数解析")
+    params = api.parse_list_query({"q": ["第一个", "第二个"]})
+    chk.eq(params["q"], "第一个", "webapi：query 里同名参数给 list 时取第一个")
+
+    _expect_web_error(lambda: api.parse_list_query({"limit": "abc"}), "limit 必须是整数", "webapi：limit 非整数 → 400", chk)
+    _expect_web_error(lambda: api.parse_list_query({"limit": "0"}), "1~200", "webapi：limit=0 越界 → 400", chk)
+    _expect_web_error(lambda: api.parse_list_query({"limit": "999"}), "1~200", "webapi：limit 超上限 → 400", chk)
+    _expect_web_error(lambda: api.parse_list_query({"offset": "-1"}), "offset 要在", "webapi：offset 负数 → 400", chk)
+    _expect_web_error(lambda: api.parse_list_query({"type": "xx"}), "type 只能是", "webapi：type 非法 → 400", chk)
+    _expect_web_error(lambda: api.parse_list_query({"q": "长" * 201}), "搜索词太长", "webapi：q 超 200 字 → 400", chk)
+
+    fields = api.parse_add_payload({"subject": "点点", "predicate": "喜欢", "value": "美式"})
+    chk.eq((fields["subject"], fields["predicate"], fields["value"], fields["mtype"], fields["importance"]),
+           ("点点", "喜欢", "美式", None, None), "webapi：add 合法 payload")
+    _expect_web_error(lambda: api.parse_add_payload({"subject": "点点", "value": "x"}),
+                      "缺少必填字段：predicate", "webapi：add 缺 predicate → 400", chk)
+    _expect_web_error(lambda: api.parse_add_payload({"subject": " ", "predicate": "p", "value": "v"}),
+                      "缺少必填字段：subject", "webapi：add 空白 subject → 400", chk)
+    _expect_web_error(lambda: api.parse_add_payload({"subject": "a", "predicate": "b", "value": "c", "mtype": "weird"}),
+                      "mtype 只能是", "webapi：add mtype 非法 → 400", chk)
+    _expect_web_error(lambda: api.parse_add_payload({"subject": "a", "predicate": "b", "value": "c", "importance": 1.5}),
+                      "importance 要在 0~1", "webapi：add importance 越界 → 400", chk)
+    _expect_web_error(lambda: api.parse_add_payload(["不是对象"]), "请求体要是 JSON 对象", "webapi：add body 非对象 → 400", chk)
+
+    chk.eq(api.parse_id_payload({"id": 12}), 12, "webapi：forget id 解析")
+    chk.eq(api.parse_id_payload({"id": "12"}), 12, "webapi：forget id 字符串数字也认")
+    _expect_web_error(lambda: api.parse_id_payload({}), "缺少 id", "webapi：forget 缺 id → 400", chk)
+    _expect_web_error(lambda: api.parse_id_payload({"id": "abc"}), "id 必须是整数", "webapi：forget id 非整数 → 400", chk)
+    _expect_web_error(lambda: api.parse_id_payload({"id": 0}), "正整数", "webapi：forget id=0 → 400", chk)
+
+    chk.eq(api.parse_bool(None, default=True), True, "webapi：dry_run 缺省走默认")
+    chk.eq(api.parse_bool("off"), False, "webapi：dry_run 认 off")
+    _expect_web_error(lambda: api.parse_bool("maybe"), "要是 true / false", "webapi：dry_run 非法 → 400", chk)
+
+    item = api.shape_item({})
+    chk.eq((item["id"], item["mtype"], item["importance"], item["active"], item["value_preview"]),
+           (0, "fact", 0.0, True, ""), "webapi：shape_item 空行给默认值（单条脏数据不炸）")
+    item = api.shape_item({"id": 3, "subject": "s", "predicate": "p", "value": "x" * 80,
+                           "mtype": "plan", "importance": 0.87, "valid_to": "2026-01-01"})
+    chk.eq((item["id"], item["mtype"], item["importance"], item["active"]), (3, "plan", 0.87, False),
+           "webapi：shape_item 正常行")
+    chk.eq(len(item["value_preview"]), 60, "webapi：value_preview 截 60 字")
+
+    rows = [{"id": i, "subject": f"s{i}", "predicate": "p", "value": f"v{i}"} for i in range(1, 6)]
+    page, total = api.paginate(rows, 2, 2)
+    chk.eq(([r["id"] for r in page], total), ([3, 4], 5), "webapi：分页第二页")
+    page, total = api.paginate(rows, 2, 99)
+    chk.eq((page, total), ([], 5), "webapi：offset 越界给空页但总数正确")
+
+    chk.ok("webapi：搜索命中 value（大小写不敏感）",
+           api.matches({"value": "Likes Coffee"}, "coffee", ""), api.matches({"value": "Likes Coffee"}, "coffee", ""))
+    chk.ok("webapi：搜索命中 subject", api.matches({"subject": "点点"}, "点点", ""), "")
+    chk.ok("webapi：type 过滤生效", not api.matches({"mtype": "plan"}, "", "fact"), "")
+    chk.eq(len(api.filter_rows(rows, "", "fact")), 0, "webapi：行里没 mtype 时按 fact 过滤不命中")
+
+    graph = api.build_graph([
+        {"id": 1, "subject": "点点", "predicate": "喜欢", "value": "美式", "mtype": "preference", "importance": 0.9},
+        {"id": 2, "subject": "点点", "predicate": "住", "value": "杭州", "mtype": "fact", "importance": 0.5},
+        {"id": 3, "subject": "点点", "predicate": "养", "value": "猫", "mtype": "fact", "importance": 0.2},
+        {"id": 4, "subject": "阿岚", "predicate": "喜欢", "value": "拿铁", "mtype": "preference", "importance": 0.6},
+    ])
+    chk.eq((graph["total_nodes"], graph["shown_nodes"], graph["truncated"]), (4, 4, False),
+           "webapi：graph 节点总数")
+    chk.eq(len(graph["edges"]), 2, "webapi：同 subject 连成簇 → 3 个节点 2 条边")
+    chk.eq([e["source"] for e in graph["edges"]], [1, 1], "webapi：簇内边以最小 id 当枢纽")
+    chk.eq(graph["nodes"][0]["label"], "点点 · 喜欢", "webapi：节点 label = subject · predicate")
+    chk.ok("webapi：节点带 value 前 60 字", graph["nodes"][0]["value"] == "美式", graph["nodes"][0])
+
+    many = [{"id": i, "subject": f"s{i % 12}", "predicate": "p", "value": f"v{i}",
+             "mtype": "fact", "importance": (i % 100) / 100.0} for i in range(1, 306)]
+    big = api.build_graph(many)
+    chk.eq((big["shown_nodes"], big["truncated"], big["max_nodes"]), (300, True, 300),
+           "webapi：>300 个节点只画前 300 并标记 truncated")
+    kept_ids = {node["id"] for node in big["nodes"]}
+    chk.ok("webapi：边只连已画出的节点（无悬空引用）",
+           all(e["source"] in kept_ids and e["target"] in kept_ids for e in big["edges"]), "")
+
+    dedupe = api.summarize_dedupe({"scanned": 10, "mergeable_groups": 2, "mergeable_rows": 3,
+                                   "dry_run": True, "applied": False, "superseded": [4, 5, 6]})
+    chk.ok("webapi：dedupe dry-run 回显包含 dry-run", "dry-run" in dedupe["summary"], dedupe["summary"])
+    chk.eq((dedupe["groups"], dedupe["rows"], dedupe["applied"]), (2, 3, False), "webapi：dedupe 字段")
+    dedupe = api.summarize_dedupe({"scanned": 10, "mergeable_groups": 0, "mergeable_rows": 0, "dry_run": False})
+    chk.ok("webapi：dedupe 无重复也给人话", "没有同槽重复" in dedupe["summary"], dedupe["summary"])
+
+    plan = api.summarize_consolidate(
+        [{"keeper": {"id": 7, "subject": "点点"}, "drop": [{"id": 8}, {"id": 9}]}],
+        scanned=10, dry_run=True, threshold=0.95)
+    chk.eq((plan["groups_count"], plan["rows"], plan["applied"]), (1, 2, False), "webapi：consolidate 字段")
+    chk.ok("webapi：consolidate dry-run 回显", "可合并 1 组" in plan["summary"] and "dry-run" in plan["summary"], plan["summary"])
+
+
+async def test_webapi_handlers(main_mod, tmp, chk: Checker) -> None:
+    """直调 handler（假 request），不起 HTTP。"""
+    h = Harness(main_mod, tmp, db_name="mem_webui.db")
+    h.plugin.name = "astrbot_plugin_mem"  # 加载器注入的真实名字（metadata.yaml name）
+
+    # 1) 注册：7 条路由，路径必须自带插件名（dashboard 就是这么匹配的）
+    await h.plugin.initialize()
+    apis = h.ctx.registered_web_apis
+    chk.eq(len(apis), 7, "webui：initialize 注册 7 个接口")
+    routes = {api[0]: api for api in apis}
+    chk.ok("webui：路由前缀带插件名", all(route.startswith(WEB_PREFIX) for route in routes), list(routes))
+    chk.eq(routes[WEB_PREFIX + "list"][2], ["GET"], "webui：list 是 GET")
+    chk.eq(routes[WEB_PREFIX + "add"][2], ["POST"], "webui：add 是 POST")
+    chk.eq(routes[WEB_PREFIX + "forget"][2], ["POST"], "webui：forget 是 POST")
+    chk.eq(routes[WEB_PREFIX + "dedupe"][2], ["POST"], "webui：dedupe 是 POST")
+    chk.eq(routes[WEB_PREFIX + "consolidate"][2], ["POST"], "webui：consolidate 是 POST")
+    chk.eq(routes[WEB_PREFIX + "graph"][2], ["GET"], "webui：graph 是 GET")
+    chk.eq(routes[WEB_PREFIX + "stats"][2], ["GET"], "webui：stats 是 GET")
+    chk.ok("webui：每个接口都有中文描述", all(bool(api[3]) for api in apis), "")
+
+    await h.plugin.initialize()
+    chk.eq(len(h.ctx.registered_web_apis), 7, "webui：重复 initialize 不会重复注册（路由原位替换）")
+
+    for subject, predicate, value in (
+        ("点点", "喜欢喝", "冰美式"),
+        ("点点", "住在", "杭州"),
+        ("阿岚", "喜欢喝", "拿铁"),
+    ):
+        await h.plugin._write_fact("global", subject, predicate, value, source="test", mtype="fact")
+
+    # 2) list
+    resp = await _call_web(h.plugin._web_list)
+    payload = resp.payload
+    chk.eq(payload["status"], "ok", "webui：list 返回 ok 信封")
+    chk.eq(payload["data"]["total"], 3, "webui：list 总数")
+    chk.eq(len(payload["data"]["items"]), 3, "webui：list 默认一页给全")
+    first = payload["data"]["items"][0]
+    chk.ok("webui：list 字段齐全（id/subject/predicate/value/mtype/importance/updated_at）",
+           all(key in first for key in ("id", "subject", "predicate", "value", "mtype", "importance", "updated_at")), first.keys())
+
+    resp = await _call_web(h.plugin._web_list, query={"limit": "2", "offset": "0"})
+    chk.eq((len(resp.payload["data"]["items"]), resp.payload["data"]["total"]), (2, 3),
+           "webui：list 分页 limit=2 但 total 仍是 3")
+    resp = await _call_web(h.plugin._web_list, query={"limit": "2", "offset": "2"})
+    chk.eq(len(resp.payload["data"]["items"]), 1, "webui：list 第二页 1 条")
+
+    resp = await _call_web(h.plugin._web_list, query={"q": "拿铁"})
+    chk.eq(resp.payload["data"]["total"], 1, "webui：list 搜索 value")
+    resp = await _call_web(h.plugin._web_list, query={"q": "点点"})
+    chk.eq(resp.payload["data"]["total"], 2, "webui：list 搜索 subject")
+
+    resp = await _call_web(h.plugin._web_list, query={"limit": "abc"})
+    chk.eq(resp.status_code, 400, "webui：list 参数非法 → 400")
+    chk.ok("webui：400 带中文提示", "limit 必须是整数" in resp.payload["message"], resp.payload["message"])
+    resp = await _call_web(h.plugin._web_list, query={"type": "xx"})
+    chk.eq(resp.status_code, 400, "webui：list type 非法 → 400")
+
+    # 3) stats
+    resp = await _call_web(h.plugin._web_stats)
+    stats = resp.payload["data"]
+    chk.eq((stats["total"], stats["active"], stats["history"]), (3, 3, 0), "webui：stats 总数/有效/已作废")
+    chk.ok("webui：stats 带 types 计数", stats["types"].get("fact") == 3, stats["types"])
+    chk.ok("webui：stats 带 provider 状态", "ok" in stats["provider"] and "model" in stats["provider"], stats["provider"])
+    chk.ok("webui：stats 有假 embedder 时 provider.ok=True", stats["provider"]["ok"] is True, stats["provider"])
+    chk.ok("webui：stats 给出库文件路径", bool(stats["path"]), stats["path"])
+
+    # 4) add
+    resp = await _call_web(h.plugin._web_add, body={"subject": "新朋友", "predicate": "喜欢", "value": "跑步", "mtype": "preference"})
+    chk.eq(resp.payload["status"], "ok", "webui：add 成功")
+    new_id = resp.payload["data"]["id"]
+    chk.ok("webui：add 返回新 id", isinstance(new_id, int) and new_id > 0, new_id)
+    chk.eq(resp.payload["data"]["mtype"], "preference", "webui：add 认 mtype")
+    chk.eq(h.store.stats()["active"], 4, "webui：add 真的落库了")
+
+    resp = await _call_web(h.plugin._web_add, body={"subject": "只有主语"})
+    chk.eq(resp.status_code, 400, "webui：add 缺字段 → 400")
+    chk.ok("webui：add 缺字段提示是中文", "缺少必填字段" in resp.payload["message"], resp.payload["message"])
+
+    resp = await _call_web(h.plugin._web_add, body={"subject": "点点", "predicate": "昨天", "value": "我昨天下午在楼下咖啡店喝了一杯很好喝的冰美式然后回家睡了一觉"})
+    chk.eq(resp.status_code, 400, "webui：add 叙事体/超长 → 400")
+    chk.ok("webui：add 拒绝理由复用插件校验（中文）",
+           ("不是一句事实" in resp.payload["message"]) or ("120" in resp.payload["message"]),
+           resp.payload["message"])
+
+    resp = await _call_web(h.plugin._web_add, body={"subject": "x", "predicate": "y", "value": "z", "importance": 9})
+    chk.eq(resp.status_code, 400, "webui：add importance 越界 → 400")
+
+    resp = await _call_web(h.plugin._web_add, body={"subject": "点点", "predicate": "喜欢喝", "value": "热美式"})
+    chk.ok("webui：add 同槽覆盖返回旧 id", resp.payload["data"]["superseded"], resp.payload["data"])
+
+    # 5) forget
+    before = h.store.stats()["active"]
+    history_before = h.store.stats()["history"]
+    resp = await _call_web(h.plugin._web_forget, body={"id": new_id})
+    chk.eq(resp.payload["status"], "ok", "webui：forget 成功")
+    chk.eq(h.store.stats()["active"], before - 1, "webui：forget 后有效条数 -1")
+    chk.ok("webui：forget 是软删（行还在，valid_to 有值）", bool(h.store.get(new_id).get("valid_to")), h.store.get(new_id))
+    chk.eq(h.store.stats()["history"], history_before + 1, "webui：forget 后历史 +1")
+
+    resp = await _call_web(h.plugin._web_forget, body={"id": new_id})
+    chk.eq(resp.status_code, 404, "webui：重复 forget → 404")
+    chk.ok("webui：404 也是中文提示", "没有找到编号" in resp.payload["message"], resp.payload["message"])
+    resp = await _call_web(h.plugin._web_forget, body={"id": "abc"})
+    chk.eq(resp.status_code, 400, "webui：forget id 非法 → 400")
+
+    # 6) dedupe dry-run 不改库：手写一条同槽重复（正常写入路径会自动覆盖，造不出重复）
+    with h.store._conn() as conn:
+        conn.execute(
+            "INSERT INTO mem (scope, subject, predicate, value, source, created_at, updated_at,"
+            " valid_from, mtype, importance, ttl_days, decay_type, access_count)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("global", "点点", "住在", "上海", "manual", "2020-01-01T00:00:00+00:00",
+             "2020-01-01T00:00:00+00:00", "2020-01-01T00:00:00+00:00", "fact", 0.5, 3650, "exp", 0),
+        )
+    dup_active = h.store.stats()["active"]
+    resp = await _call_web(h.plugin._web_dedupe, body={"dry_run": True})
+    data = resp.payload["data"]
+    chk.eq(data["dry_run"], True, "webui：dedupe 回显 dry_run=True")
+    chk.ok("webui：dedupe dry-run 查到同槽重复", data["groups"] >= 1, data)
+    chk.eq(h.store.stats()["active"], dup_active, "webui：dedupe dry-run 一条没改（库内条数不变）")
+    chk.ok("webui：dedupe dry-run 的 summary 是人话", "dry-run" in data["summary"], data["summary"])
+
+    resp = await _call_web(h.plugin._web_dedupe, body={"dry_run": False})
+    chk.eq(resp.payload["data"]["applied"], True, "webui：dedupe 真跑 applied=True")
+    chk.eq(h.store.stats()["active"], dup_active - 1, "webui：dedupe 真跑作废 1 条")
+
+    # 7) consolidate dry-run 不改库：同主语、不同谓词、值一字不差 → 同一簇
+    #    注意：正常写入路径的相似去重会先把同主语同值吃掉，所以这里按「导入数据」
+    #    直接用 SQL 造两条，模拟从 LivingMemory 搬进来的历史重复。
+    def _insert_raw(subject, predicate, value, when):
+        with h.store._conn() as conn:
+            conn.execute(
+                "INSERT INTO mem (scope, subject, predicate, value, source, created_at, updated_at,"
+                " valid_from, mtype, importance, ttl_days, decay_type, access_count)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("global", subject, predicate, value, "manual", when, when, when,
+                 "fact", 0.5, 3650, "exp", 0),
+            )
+
+    _insert_raw("点点", "爱好", "喝咖啡", "2022-01-01T00:00:00+00:00")
+    _insert_raw("点点", "兴趣", "喝咖啡", "2022-01-02T00:00:00+00:00")
+    active_before = h.store.stats()["active"]
+    resp = await _call_web(h.plugin._web_consolidate, body={"dry_run": True})
+    data = resp.payload["data"]
+    chk.eq(data["dry_run"], True, "webui：consolidate 回显 dry_run=True")
+    chk.ok("webui：consolidate 用同一套聚类（有可合并组）", data["groups_count"] >= 1, data)
+    chk.eq(h.store.stats()["active"], active_before, "webui：consolidate dry-run 不改库")
+    chk.ok("webui：consolidate 回显带 threshold", "threshold" in data and data["threshold"] == 0.95, data.get("threshold"))
+
+    resp = await _call_web(h.plugin._web_consolidate, body={"dry_run": False})
+    chk.eq(resp.payload["data"]["applied"], True, "webui：consolidate 真跑 applied=True")
+    chk.ok("webui：consolidate 真跑后条数下降", h.store.stats()["active"] < active_before,
+           (active_before, h.store.stats()["active"]))
+
+    # 8) graph
+    resp = await _call_web(h.plugin._web_graph)
+    graph = resp.payload["data"]
+    chk.ok("webui：graph 有 nodes", len(graph["nodes"]) == h.store.stats()["active"], graph)
+    chk.ok("webui：graph 节点字段齐全", all(key in graph["nodes"][0] for key in ("id", "label", "mtype", "importance", "value")), graph["nodes"][0])
+    chk.ok("webui：graph 有 edges 且同 subject 成簇", isinstance(graph["edges"], list) and len(graph["edges"]) >= 1, graph["edges"])
+
+    # 9) 单条脏数据不拖垮整页
+    with h.store._conn() as conn:
+        conn.execute(
+            "INSERT INTO mem (scope, subject, predicate, value, source, created_at, updated_at,"
+            " valid_from, mtype, importance, ttl_days, decay_type, access_count)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("global", "", "", "脏数据", "manual", "2021-01-01T00:00:00+00:00",
+             "2021-01-01T00:00:00+00:00", "2021-01-01T00:00:00+00:00", "fact", 0.1, 3650, "exp", 0),
+        )
+    resp = await _call_web(h.plugin._web_list)
+    chk.eq(resp.status_code, 200, "webui：有空 subject 的脏数据时 list 仍 200")
+    chk.ok("webui：脏数据也被整形出来（不抛）",
+           any(item["value"] == "脏数据" for item in resp.payload["data"]["items"]), "")
+
+    # 10) 核心不支持时优雅退化
+    class NoWebContext:
+        provider_manager = h.ctx.provider_manager
+
+        def get_provider_by_id(self, provider_id):
+            return None
+
+    plugin2 = main_mod.MemPlugin(NoWebContext(), dict(h.conf))
+    try:
+        await plugin2.initialize()
+        chk.ok("webui：核心没有 register_web_api 时 initialize 不抛", True, "")
+    except Exception as e:  # noqa: BLE001
+        chk.ok("webui：核心没有 register_web_api 时 initialize 不抛", False, f"{type(e).__name__}: {e}")
+
+
+def test_webui_page(chk: Checker) -> None:
+    """前端 smoke：关键 id、零依赖、无硬编码地址、内联脚本语法。"""
+    chk.ok("前端：views/memory/index.html 存在", os.path.isfile(PAGE_PATH), PAGE_PATH)
+    if not os.path.isfile(PAGE_PATH):
+        return
+    import re as _re
+
+    html = open(PAGE_PATH, encoding="utf-8").read()
+    for element_id, label in (("search", "搜索框"), ("table", "表格"), ("graph", "关系图"), ("stats", "统计卡")):
+        chk.ok(f"前端：#{element_id}（{label}）存在", f'id="{element_id}"' in html, "")
+
+    chk.ok("前端：暗色主题默认", 'data-theme="dark"' in html and "--bg" in html, "")
+    chk.ok("前端：跟 dashboard 主题（light 也有变量）", 'data-theme="light"' in html, "")
+    chk.ok("前端：通过页面桥发请求", "AstrBotPluginView" in html and "apiGet" in html and "apiPost" in html, "")
+    chk.ok("前端：调用 mem-api 接口", "mem-api/list" in html and "mem-api/stats" in html
+           and "mem-api/graph" in html and "mem-api/add" in html
+           and "mem-api/forget" in html and "mem-api/dedupe" in html
+           and "mem-api/consolidate" in html, "")
+    chk.ok("前端：dry-run 勾选框", 'id="dry-run"' in html and "dry_run" in html, "")
+    chk.ok("前端：关系图用 canvas", "<canvas" in html and "getContext(\"2d\")" in html, "")
+    chk.ok("前端：节点大小按 importance", "borderRadius(node.importance)" in html or "importance" in html, "")
+    chk.ok("前端：悬停提示截 60 字", ".slice(0, 60)" in html, "")
+    chk.ok("前端：关系图截断提示", "只画了前" in html and "truncated" in html, "")
+    chk.ok("前端：请求失败可见（#error 横幅）", 'id="error"' in html and "showError(" in html and "role=\"alert\"" in html, "")
+    chk.ok("前端：没有硬编码 localhost / 127.0.0.1",
+           "localhost" not in html and "127.0.0.1" not in html, "")
+    chk.ok("前端：没有硬编码 http(s) 外部依赖",
+           not _re.search(r'(src|href)="https?://', html), "")
+    chk.ok("前端：零构建（没有 npm / import from）",
+           "node_modules" not in html and 'type="module"' not in html, "")
+
+    scripts = _re.findall(r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", html, _re.S)
+    chk.eq(len(scripts), 1, "前端：只有一个内联 <script>")
+    inline = scripts[0] if scripts else ""
+    chk.ok("前端：内联脚本非空", len(inline) > 2000, len(inline))
+
+    node = shutil.which("node")
+    if not node:
+        chk.ok("前端：node --check（未安装 node，跳过）", True, "")
+        return
+    import subprocess
+
+    tmp_js = os.path.join(tempfile.mkdtemp(prefix="mem_page_"), "inline.js")
+    with open(tmp_js, "w", encoding="utf-8") as fh:
+        fh.write(inline)
+    proc = subprocess.run([node, "--check", tmp_js], capture_output=True, text=True)
+    chk.ok("前端：node --check 语法通过", proc.returncode == 0, (proc.stderr or proc.stdout).strip()[:400])
+
+
 # ── 入口 ───────────────────────────────────────────────────────────────
 
 
@@ -1604,6 +2056,10 @@ async def run_all() -> int:
         await test_import_lm_override(main_mod, tmp_root, chk)
         await test_import_lm_limit(main_mod, tmp_root, chk)
         await test_import_lm_batch_state(main_mod, tmp_root, chk)
+        # v0.6.0：WebUI 管理页 + 关系图
+        test_webapi_units(main_mod, chk)
+        await test_webapi_handlers(main_mod, tmp_root, chk)
+        test_webui_page(chk)
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
 

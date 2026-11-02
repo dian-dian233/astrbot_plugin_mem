@@ -434,6 +434,37 @@ class Store:
                 )
         return [_row_to_dict(r) for r in rows]
 
+    @_db_guard
+    def forget_ids(self, mem_ids: list[int]) -> list[dict]:
+        """按 id 作废有效记录（填 valid_to，不物理删）。返回被作废的行。
+
+        给 WebUI 表格的「作废」按钮用：`forget()` 按关键词匹配，命中面太宽，
+        点一行可能带走一串；这里只认 id。语义与 `forget()` 一致——只填
+        `valid_to` / `updated_at`，不填 `superseded_by`（不是被新值取代）。
+        """
+        ts = now_iso()
+        wanted: list[int] = []
+        for item in mem_ids or []:
+            try:
+                value = int(item)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                wanted.append(value)
+        if not wanted:
+            return []
+        marks = ",".join("?" for _ in wanted)
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM mem WHERE valid_to IS NULL AND id IN ({marks})", wanted
+            ).fetchall()
+            for r in rows:
+                conn.execute(
+                    "UPDATE mem SET valid_to=?, updated_at=? WHERE id=? AND valid_to IS NULL",
+                    (ts, ts, r["id"]),
+                )
+        return [_row_to_dict(r) for r in rows]
+
     # ── 生命周期：访问强化 / 衰减回合 / 合并 ──────────────────────────
 
     @_db_guard

@@ -1,0 +1,62 @@
+{
+  "db_path": {
+    "description": "记忆库文件路径",
+    "type": "string",
+    "hint": "留空 = AstrBot data 目录下的 mem.db（推荐）。不要填插件代码目录，升级插件会丢数据。",
+    "default": ""
+  },
+  "scope": {
+    "description": "默认作用域（写入归属）",
+    "type": "string",
+    "hint": "默认 global，所有会话共享一份。也可在 /mem add 末尾加 --scope group:123 / --scope user:10001 分池。",
+    "default": "global"
+  },
+  "embed_provider_id": {
+    "description": "Embedding 提供商 ID",
+    "type": "string",
+    "hint": "留空 = 自动挑第一个已配置的 embedding provider；都不可用时自动退关键词，不报错。填 WebUI「服务提供商」里的 ID。",
+    "default": ""
+  },
+  "rerank_provider_id": {
+    "description": "Rerank 提供商 ID",
+    "type": "string",
+    "hint": "留空 = 自动挑第一个已配置的 rerank provider；不可用时按向量/关键词排序。",
+    "default": ""
+  },
+  "recall_k": {
+    "description": "召回条数",
+    "type": "int",
+    "hint": "向量 + 关键词召回后送去重排的候选上限，默认 30。",
+    "default": 30
+  },
+  "rerank_k": {
+    "description": "最终条数",
+    "type": "int",
+    "hint": "重排后返回给模型/用户的条数，默认 5。",
+    "default": 5
+  },
+  "auto_inject_n": {
+    "description": "每轮自动注入条数",
+    "type": "int",
+    "hint": "0 = 不注入任何记忆（默认，推荐）。N>0 才每轮把 top-N 条塞进 system_prompt，每条截 200 字。会污染闲聊人格并破坏 prompt 缓存。",
+    "default": 0
+  },
+  "allow_all": {
+    "description": "允许所有人写记忆",
+    "type": "bool",
+    "hint": "默认 false：写操作只给管理员 + 下面两张白名单。读操作本来就不受限。",
+    "default": false
+  },
+  "allowed_users": {
+    "description": "允许写记忆的用户 ID",
+    "type": "list",
+    "hint": "填平台用户 ID（QQ 号），一行一个。",
+    "default": []
+  },
+  "allowed_groups": {
+    "description": "允许写记忆的群号",
+    "type": "list",
+    "hint": "填群号，一行一个。群里任何人发写指令都放行。",
+    "default": []
+  }
+}

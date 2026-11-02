@@ -30,6 +30,15 @@ v0.3.0 新增（记忆生命周期 / RRF / consolidate）：
  21. consolidate：--dry-run 不改库；真跑后条数下降、importance 取 max、access 求和
  22. 老库（v0.2 表结构）自动补列，历史数据可读可检索
  23. plan 类型识别（线索词 / --type 覆盖）与 TTL 落库
+
+v0.4.0 新增（从 LivingMemory 搬家 /mem import-lm）：
+ 24. 假 livingmemory.db（schema 照抄对方 storage/atom_store.py）端到端：读 5 条 → 导入 3 条
+ 25. 跳过：status=archived、内容重复；同槽新者胜、旧的不许盖新的
+ 26. 切分规则：长谓词优先 / 1<idx≤24 / 长叙事退回「遗留记忆 · 内容 · 原文」
+ 27. atom_type → mtype、decay_type → decay_type、reinforcement_count → access_count
+ 28. epoch 浮点 ↔ ISO 字符串（也兼容本来就是 ISO 的列）
+ 29. --dry-run 不改库、--limit 截断、缺列表也能导入、只读句柄写不进去
+ 30. 自动探测顺序 + 递归深度上限 + 跳过 site-packages；找不到库不抛 traceback
 """
 
 from __future__ import annotations
@@ -1112,6 +1121,430 @@ async def test_mtype_resolution(main_mod, tmp, chk: Checker) -> None:
     chk.ok("未知类型 → 回落默认 fact", "[fact]" in r, r)
 
 
+# ── v0.4.0：从 LivingMemory 搬家（/mem import-lm） ─────────────────────
+#
+# 全程离线：自己造一个假 livingmemory.db（schema 照抄对方 storage/atom_store.py:59），
+# 不打任何模型接口，也不碰真人的库。
+
+LM_SCHEMA = """
+CREATE TABLE IF NOT EXISTS memory_atoms (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  parent_memory_id INTEGER NOT NULL DEFAULT 0,
+  atom_type TEXT NOT NULL DEFAULT 'unknown',
+  content TEXT NOT NULL,
+  entities TEXT DEFAULT '[]',
+  importance REAL NOT NULL DEFAULT 0.5,
+  confidence REAL NOT NULL DEFAULT 0.7,
+  created_at REAL NOT NULL DEFAULT 0,
+  last_accessed_at REAL NOT NULL DEFAULT 0,
+  last_reinforced_at REAL,
+  event_time REAL,
+  ttl_days REAL NOT NULL DEFAULT 30.0,
+  expires_at REAL NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'active',
+  reinforcement_count INTEGER NOT NULL DEFAULT 0,
+  decay_type TEXT NOT NULL DEFAULT 'exponential',
+  session_id TEXT,
+  persona_id TEXT,
+  metadata TEXT DEFAULT '{}'
+)
+"""
+
+EPOCH = 1700000000.0          # 2023-11-14T22:13:20Z，随便挑的一个整点
+EPOCH_ISO = "2023-11-14T22:13:20"
+
+
+def make_lm_db(path: str, rows, *, schema: str = LM_SCHEMA, table: str = "memory_atoms") -> str:
+    """造一个假的 LivingMemory 库（schema 和对方一致，列可以缺）。"""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(schema)
+        for row in rows:
+            keys = list(row)
+            conn.execute(
+                f"INSERT INTO {table}({','.join(keys)}) VALUES({','.join('?' * len(keys))})",
+                [row[k] for k in keys],
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return path
+
+
+def lm_rows():
+    """5 条：3 条该进、1 条非活跃、1 条和第一条内容重复（切不动的那条走退回整体）。"""
+    return [
+        {
+            "id": 1, "atom_type": "semantic", "content": "服务器的 SSH 端口是 22022",
+            "importance": 0.9, "confidence": 0.8, "created_at": EPOCH,
+            "last_accessed_at": EPOCH + 86400, "ttl_days": 3650.0,
+            "decay_type": "exponential", "status": "active", "reinforcement_count": 3,
+            "session_id": "qq:FriendMessage:1", "persona_id": "点点",
+        },
+        {
+            "id": 2, "atom_type": "planned", "content": "明天要交周报",
+            "importance": 0.6, "confidence": 0.7, "created_at": EPOCH,
+            "last_accessed_at": EPOCH, "ttl_days": 2.0,
+            "decay_type": "step", "status": "active", "reinforcement_count": 0,
+        },
+        {
+            "id": 3, "atom_type": "episodic", "content": "那天风很大我们走了很久才到家",
+            "importance": 0.4, "confidence": 0.6, "created_at": EPOCH,
+            "last_accessed_at": EPOCH, "ttl_days": 30.0,
+            "decay_type": "exponential", "status": "active",
+        },
+        {
+            "id": 4, "atom_type": "semantic", "content": "服务器的 SSH 端口是 22022",
+            "importance": 0.5, "created_at": EPOCH + 60, "ttl_days": 3650.0,
+            "decay_type": "exponential", "status": "archived",
+        },
+        {
+            "id": 5, "atom_type": "unknown", "content": "服务器的 SSH 端口是 22022",
+            "importance": 0.3, "created_at": EPOCH + 120, "ttl_days": 30.0,
+            "decay_type": "exponential", "status": "active",
+        },
+    ]
+
+
+def lm_module():
+    return _mod("livingmemory")
+
+
+def _active(store, subject, predicate=None):
+    for row in store.active_rows():
+        if row["subject"] == subject and (predicate is None or row["predicate"] == predicate):
+            return row
+    return {}
+
+def test_import_lm_units(main_mod, chk: Checker) -> None:
+    """纯函数：切分规则 / 类型映射 / 时间转换 / 参数解析。"""
+    lm = lm_module()
+
+    chk.eq(lm.split_content("服务器的 SSH 端口是 22022"),
+           ("服务器的 SSH 端口", "是", "22022", True), "切分：是 → 三元组")
+    chk.eq(lm.split_content("明天要交周报"),
+           ("明天", "要", "交周报", True), "切分：要 → 三元组")
+    chk.eq(lm.split_content("点点住在 A 房间"),
+           ("点点", "住在", "A 房间", True), "切分：长谓词「住在」优先于「住」「在」")
+    chk.eq(lm.split_content("我在读书"),
+           ("遗留记忆", "内容", "我在读书", False), "切分：主语只有 1 字（idx=1）不切")
+    too_long = "长" * 25 + "是值"
+    chk.eq(lm.split_content(too_long),
+           ("遗留记忆", "内容", too_long, False), "切分：命中位置超过 24 字不切")
+    chk.eq(lm.split_content("那天风很大我们走了很久才到家"),
+           ("遗留记忆", "内容", "那天风很大我们走了很久才到家", False), "切分：长叙事退回整体")
+    chk.eq(lm.split_content(""), ("遗留记忆", "内容", "", False), "切分：空内容也不炸")
+
+    chk.eq(lm.to_iso(EPOCH)[:19], EPOCH_ISO, "时间：epoch 浮点 → ISO")
+    chk.eq(lm.to_iso(str(EPOCH))[:19], EPOCH_ISO, "时间：纯数字串也当 epoch")
+    chk.ok("时间：ISO 字符串没被当 epoch（年份不是 1970）",
+           lm.to_iso("2026-10-27T06:25:00+00:00").startswith("2026"))
+    chk.eq(lm.to_iso("不是时间", default="FALLBACK"), "FALLBACK", "时间：认不出来回默认值")
+    chk.eq(lm.to_iso(None, default=""), "", "时间：None 不炸")
+
+    columns = set(lm.ATOM_COLUMNS)
+    planned = lm.map_atom({"atom_type": "planned", "content": "明天要交周报"}, columns)
+    chk.eq(planned["mtype"], "plan", "类型：planned → plan")
+    chk.eq(float(planned["ttl_days"]), 2.0, "类型：planned 缺 ttl_days 时用本插件默认 2 天")
+    chk.eq(planned["decay_type"], "step", "类型：planned 缺 decay_type 时用 step")
+
+    for atom_type, expected in (("episodic", "event"), ("semantic", "fact"),
+                                ("procedural", "preference"), ("unknown", "fact"),
+                                ("垃圾类型", "fact")):
+        mapped = lm.map_atom({"atom_type": atom_type, "content": "点点是机器人"}, columns)
+        chk.eq(mapped["mtype"], expected, f"类型：{atom_type} → {expected}")
+
+    chk.eq(lm.map_atom({"content": "x", "status": "archived"}, columns)["skip"], "inactive",
+           "跳过：status=archived")
+    chk.eq(lm.map_atom({"content": "   "}, columns)["skip"], "empty", "跳过：空内容")
+
+    chk.eq(lm.map_atom({"content": "点点住在 A", "decay_type": "linear"}, columns)["decay_type"],
+           "linear", "衰减：linear 带过")
+    chk.eq(lm.map_atom({"content": "点点住在 A", "decay_type": "step"}, columns)["decay_type"],
+           "step", "衰减：step 带过")
+    chk.eq(lm.map_atom({"content": "点点住在 A", "decay_type": "奇怪"}, columns)["decay_type"],
+           "exp", "衰减：认不出来 → exp")
+
+    dropped = lm.map_atom(
+        {"content": "点点住在 A", "session_id": "s1", "persona_id": "p1"}, columns)
+    chk.ok("丢弃计数：session_id 命中", dropped["dropped_session"] is True)
+    chk.ok("丢弃计数：persona_id 命中", dropped["dropped_persona"] is True)
+    chk.ok("丢弃：session_id 没被塞进 value",
+           "s1" not in f"{dropped['subject']}{dropped['predicate']}{dropped['value']}")
+
+    # 缺列：只有 id/content/importance 也必须能映射
+    thin_cols = {"id", "content", "importance"}
+    thin = lm.map_atom({"id": 1, "content": "服务器需要用 22022 端口", "importance": 0.8},
+                       thin_cols)
+    chk.eq(thin["mtype"], "fact", "缺列：没 atom_type 也回 fact")
+    chk.eq(float(thin["ttl_days"]), 3650.0, "缺列：没 ttl_days 用默认 3650")
+    chk.eq(thin["access_count"], 0, "缺列：没 reinforcement_count 当 0")
+    chk.ok("缺列：没 created_at 就用现在", bool(thin["created_at"]))
+
+    chk.eq(main_mod.parse_import_lm(""),
+           {"dry_run": False, "path": "", "limit": 0}, "解析：无参数 → 全默认")
+    chk.eq(main_mod.parse_import_lm("--dry-run"),
+           {"dry_run": True, "path": "", "limit": 0}, "解析：--dry-run")
+    chk.eq(main_mod.parse_import_lm("--path /tmp/lm.db --limit 10 --dry-run"),
+           {"dry_run": True, "path": "/tmp/lm.db", "limit": 10}, "解析：三个参数一起")
+    for bad in ("--limit 0", "--limit abc", "--dryrun", "--path"):
+        try:
+            main_mod.parse_import_lm(bad)
+            chk.ok(f"解析：`{bad}` 报错", False)
+        except main_mod.ArgError:
+            chk.ok(f"解析：`{bad}` 报错", True)
+
+async def test_import_lm_end_to_end(main_mod, tmp, chk: Checker) -> None:
+    """主链路：5 条假数据 → 导入 3、跳过 1 非活跃 / 1 重复；类型 / TTL / 时间都对。"""
+    lm_path = make_lm_db(os.path.join(tmp, "lm_e2e", "livingmemory.db"), lm_rows())
+    h = Harness(main_mod, tmp, db_name="mem_e2e.db", rerank=False)
+
+    text = await h.cmd(f"mem import-lm --path {lm_path}")
+    chk.ok("搬家：输出带库路径", lm_path in text, text)
+    chk.ok("搬家：读入 5 条", "读入 5 条" in text, text)
+    chk.ok("搬家：导入 3 条（切 2 / 退回 1）",
+           "导入 3 条（切出三元组 2 / 退回整体 1）" in text, text)
+    chk.ok("搬家：跳过 1 重复 + 1 非活跃",
+           "跳过：已存在重复 1、非活跃 1" in text, text)
+    chk.ok("搬家：输出有时耗行", "用时" in text, text)
+    chk.ok("搬家：一条消息不刷屏", len(text.splitlines()) <= 8, text)
+
+    chk.eq(h.store.stats()["active"], 3, "搬家：库里有效记录 3 条")
+    chk.eq(h.store.stats()["history"], 0, "搬家：没有历史行（没走覆盖）")
+
+    planned = _active(h.store, "明天", "要")
+    chk.eq(planned.get("mtype"), "plan", "搬家：planned → mtype=plan")
+    chk.eq(float(planned.get("ttl_days") or 0), 2.0, "搬家：planned 的 ttl 2 天")
+    chk.eq(str(planned.get("decay_type")), "step", "搬家：planned 用 step")
+
+    split_row = _active(h.store, "服务器的 SSH 端口", "是")
+    chk.eq(split_row.get("value"), "22022", "搬家：切出三元组（值是 22022）")
+    chk.eq(float(split_row.get("importance") or 0), 0.9, "搬家：importance 原样带过")
+    chk.eq(int(split_row.get("access_count") or 0), 3, "搬家：reinforcement_count → access_count")
+    chk.eq(str(split_row.get("created_at"))[:19], EPOCH_ISO, "搬家：epoch 转出的 ISO 时间正确")
+    chk.eq(str(split_row.get("source")), "livingmemory", "搬家：来源标记为 livingmemory")
+
+    fallback = _active(h.store, "遗留记忆", "内容")
+    chk.eq(fallback.get("value"), "那天风很大我们走了很久才到家", "搬家：切不动的退回整体")
+
+    chk.ok("搬家：session_id / persona_id 计数上报",
+           "丢弃：" in text and "session_id 1 条" in text, text)
+
+    # 对方的库一个字节都不许改
+    conn = sqlite3.connect(lm_path)
+    try:
+        chk.eq(conn.execute("SELECT COUNT(*) FROM memory_atoms").fetchone()[0], 5,
+               "搬家：对方的库行数没变")
+        chk.eq(conn.execute(
+            "SELECT COUNT(*) FROM memory_atoms WHERE status='archived'").fetchone()[0], 1,
+            "搬家：对方的库状态没被改")
+    finally:
+        conn.close()
+
+    again = await h.cmd(f"mem import-lm --path {lm_path}")
+    chk.ok("搬家：二次导入全是重复", "导入 0 条" in again and "已存在重复 4" in again, again)
+
+
+async def test_import_lm_dry_run(main_mod, tmp, chk: Checker) -> None:
+    """--dry-run 只统计不改库（报出来的数还得和真跑一致）。"""
+    lm_path = make_lm_db(os.path.join(tmp, "lm_dry", "livingmemory.db"), lm_rows())
+    h = Harness(main_mod, tmp, db_name="mem_dry.db", rerank=False)
+
+    text = await h.cmd(f"mem import-lm --path {lm_path} --dry-run")
+    chk.ok("dry-run：输出标明只统计", "--dry-run" in text, text)
+    chk.ok("dry-run：统计口径和真跑一致",
+           "导入 3 条（切出三元组 2 / 退回整体 1）" in text, text)
+    chk.eq(h.store.stats()["active"], 0, "dry-run：库里一条没多")
+
+    await h.cmd(f"mem import-lm --path {lm_path}")
+    chk.eq(h.store.stats()["active"], 3, "dry-run 之后真跑：3 条进库")
+
+
+async def test_import_lm_missing_db(main_mod, tmp, chk: Checker) -> None:
+    """库不存在 → 报「没找到」+ 列出搜过的位置，不抛 traceback。"""
+    empty = os.path.join(tmp, "lm_missing", "empty_data")
+    os.makedirs(empty, exist_ok=True)
+    h = Harness(main_mod, tmp, db_name="mem_missing.db", rerank=False)
+    h.plugin._data_dirs = lambda: [empty]
+
+    text = await h.cmd("mem import-lm")
+    chk.ok("找不到库：说人话", "没找到 LivingMemory 的库" in text, text)
+    chk.ok("找不到库：给出 --path 补救办法", "--path" in text, text)
+    chk.ok("找不到库：列出搜过的位置",
+           "plugin_data/astrbot_plugin_livingmemory/livingmemory.db" in text, text)
+    chk.ok("找不到库：没有 traceback", "Traceback" not in text, text)
+
+    text = await h.cmd(f"mem import-lm --path {os.path.join(tmp, 'nope', 'livingmemory.db')}")
+    chk.ok("找不到库：--path 指到不存在的文件也列出该路径",
+           "nope/livingmemory.db" in text, text)
+
+
+def test_import_lm_readonly(main_mod, tmp, chk: Checker) -> None:
+    """只读打开：mode=ro 的句柄写不进去。"""
+    lm = lm_module()
+    lm_path = make_lm_db(os.path.join(tmp, "lm_ro", "livingmemory.db"), lm_rows()[:1])
+    conn = lm.open_ro(lm_path)
+    try:
+        try:
+            conn.execute("INSERT INTO memory_atoms(content) VALUES('偷偷写一条')")
+            chk.ok("只读：INSERT 被拒", False)
+        except sqlite3.OperationalError as e:
+            chk.ok("只读：INSERT 被拒", "readonly" in str(e).lower(), str(e))
+        chk.eq(conn.execute("SELECT COUNT(*) FROM memory_atoms").fetchone()[0], 1,
+               "只读：读得到数据")
+    finally:
+        conn.close()
+    try:
+        lm.open_ro(os.path.join(tmp, "lm_ro", "not-here.db"))
+        chk.ok("只读：库不存在抛 LivingMemoryError", False)
+    except lm.LivingMemoryError:
+        chk.ok("只读：库不存在抛 LivingMemoryError", True)
+
+def test_import_lm_probe(main_mod, tmp, chk: Checker) -> None:
+    """自动探测顺序：固定候选 → 递归（≤4 层，跳过 site-packages）→ 找不到。"""
+    lm = lm_module()
+    data = os.path.join(tmp, "lm_probe", "data")
+    os.makedirs(data, exist_ok=True)
+
+    chk.eq(lm.probe([data])["path"], "", "探测：空目录找不到")
+
+    fixed = make_lm_db(
+        os.path.join(data, "plugin_data", "astrbot_plugin_livingmemory", "livingmemory.db"),
+        lm_rows()[:1])
+    found = lm.probe([data])
+    chk.eq(found["path"], os.path.realpath(fixed),
+           "探测：命中 plugin_data/astrbot_plugin_livingmemory")
+    chk.eq(found["source"], "AstrBot data 目录", "探测：来源标为 data 目录")
+    chk.ok("探测：搜过的位置按顺序记下来",
+           found["tried"][0].endswith("plugin_data/astrbot_plugin_livingmemory/livingmemory.db"),
+           found["tried"][:1])
+
+    configured = make_lm_db(os.path.join(tmp, "lm_probe", "manual.db"), lm_rows()[:1])
+    chk.eq(lm.probe([data], configured=configured)["path"], os.path.realpath(configured),
+           "探测：配置 lm_db_path 优先")
+    manual_dir = os.path.join(tmp, "lm_probe_dir")
+    manual = make_lm_db(os.path.join(manual_dir, "livingmemory.db"), lm_rows()[:1])
+    chk.eq(lm.probe([data], configured=manual_dir)["path"], os.path.realpath(manual),
+           "探测：配置给目录时自动补 livingmemory.db")
+
+    # 只有递归才找得到的位置
+    deep = os.path.join(tmp, "lm_deep", "data")
+    deep_db = make_lm_db(os.path.join(deep, "a", "b", "c", "livingmemory.db"), lm_rows()[:1])
+    found = lm.probe([deep])
+    chk.eq(found["path"], os.path.realpath(deep_db), "探测：递归兜底找得到（深度 3）")
+    chk.ok("探测：递归命中的来源写清楚", "递归" in found["source"], found["source"])
+
+    # 超过 4 层不找
+    too_deep = os.path.join(tmp, "lm_too_deep", "data")
+    make_lm_db(os.path.join(too_deep, "d1", "d2", "d3", "d4", "d5", "livingmemory.db"),
+               lm_rows()[:1])
+    chk.eq(lm.probe([too_deep])["path"], "", "探测：超过 4 层不递归")
+
+    # site-packages 里同名的是依赖自带的，不是运行时数据
+    skipped = os.path.join(tmp, "lm_skip", "data")
+    make_lm_db(os.path.join(skipped, "site-packages", "x", "livingmemory.db"), lm_rows()[:1])
+    chk.eq(lm.probe([skipped])["path"], "", "探测：跳过 site-packages")
+
+    tried = lm.probe([skipped])["tried"]
+    chk.ok("探测：找不到时 tried 里有全部固定候选",
+           all(p in tried for p in lm.candidate_paths([skipped])), tried)
+
+
+async def test_import_lm_missing_columns(main_mod, tmp, chk: Checker) -> None:
+    """缺列场景：只有 id/content/importance 也要能导入，不整批失败。"""
+    schema = """
+    CREATE TABLE IF NOT EXISTS memory_atoms (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      content TEXT NOT NULL,
+      importance REAL DEFAULT 0.5
+    )
+    """
+    lm_path = make_lm_db(
+        os.path.join(tmp, "lm_thin", "livingmemory.db"),
+        [{"content": "服务器需要用 22022 端口"}, {"content": "点点喜欢喝乌龙茶"}],
+        schema=schema)
+    h = Harness(main_mod, tmp, db_name="mem_thin.db", rerank=False)
+
+    text = await h.cmd(f"mem import-lm --path {lm_path}")
+    chk.ok("缺列：导入不崩", "导入 2 条" in text, text)
+    chk.ok("缺列：报告里说明补了几列", "缺 " in text and "列" in text, text)
+    chk.eq(h.store.stats()["active"], 2, "缺列：两条都进库")
+    row = _active(h.store, "服务器", "需要")
+    chk.eq(row.get("mtype"), "fact", "缺列：没有 atom_type → fact")
+    chk.eq(float(row.get("ttl_days") or 0), 3650.0, "缺列：没有 ttl_days → 3650")
+    chk.ok("缺列：没有 created_at 也写了时间", bool(row.get("created_at")))
+
+
+async def test_import_lm_override(main_mod, tmp, chk: Checker) -> None:
+    """同槽：新值覆盖旧值（留历史）；比库里现有记录旧的不许盖。"""
+    lm_path = make_lm_db(
+        os.path.join(tmp, "lm_slot", "livingmemory.db"),
+        [
+            {"atom_type": "semantic", "content": "点点住在 A 房间", "created_at": EPOCH},
+            {"atom_type": "semantic", "content": "点点住在 B 房间", "created_at": EPOCH + 600},
+        ])
+
+    h = Harness(main_mod, tmp, db_name="mem_slot.db", rerank=False)
+    text = await h.cmd(f"mem import-lm --path {lm_path}")
+    chk.ok("同槽：报出覆盖 1 条", "覆盖同槽旧值 1 条" in text, text)
+    chk.eq(h.store.stats()["active"], 1, "同槽：有效记录只留 1 条")
+    chk.eq(h.store.stats()["history"], 1, "同槽：旧值进历史（不物理删）")
+    chk.eq(_active(h.store, "点点", "住在").get("value"), "B 房间", "同槽：新者胜")
+
+    # 库里已有一条更「新」的同槽记录 → 老数据不许盖掉它
+    h2 = Harness(main_mod, tmp, db_name="mem_slot2.db", rerank=False)
+    h2.store.add("global", "点点", "住在", "C 房间", mtype="fact",
+                 created_at="2099-01-01T00:00:00+00:00")
+    text = await h2.cmd(f"mem import-lm --path {lm_path} --limit 1")
+    chk.ok("同槽：比现有记录旧的不覆盖", "旧于现有 1" in text, text)
+    chk.eq(_active(h2.store, "点点", "住在").get("value"), "C 房间", "同槽：现有新值没被冲掉")
+
+
+async def test_import_lm_batch_state(main_mod, tmp, chk: Checker) -> None:
+    """跨批次：620 条（>1 批 500）时 dry-run 的数字必须和真跑一模一样。
+
+    踩过的坑：dry-run 每批回滚，跨批次去重状态不传出去 → 第二批看不到第一批写过的内容，
+    报出来的「重复」比真跑少。`Store.import_records(state=...)` 就是为了这个。
+    """
+    rows = []
+    for i in range(620):
+        content = f"用户{i}的偏好是深色主题"
+        if i == 5:
+            content = "重复的一条事实是同一个值"
+        if i == 508:  # 跨过 500 边界，且和 #5 内容完全一样
+            content = "重复的一条事实是同一个值"
+        rows.append({"atom_type": "semantic", "content": content,
+                     "created_at": EPOCH + i, "ttl_days": 3650.0})
+    lm_path = make_lm_db(os.path.join(tmp, "lm_batch", "livingmemory.db"), rows)
+
+    dry = Harness(main_mod, tmp, db_name="mem_batch_dry.db", rerank=False)
+    dry_text = await dry.cmd(f"mem import-lm --path {lm_path} --dry-run")
+    chk.eq(dry.store.stats()["active"], 0, "跨批次：dry-run 一条没写")
+
+    real = Harness(main_mod, tmp, db_name="mem_batch_real.db", rerank=False)
+    real_text = await real.cmd(f"mem import-lm --path {lm_path}")
+    chk.eq(real.store.stats()["active"], 619, "跨批次：620 条里 1 条重复 → 619 条")
+
+    def numbers(text):
+        return [line for line in text.splitlines() if line.startswith(("读入", "跳过", "表："))]
+
+    chk.eq(numbers(dry_text), numbers(real_text), "跨批次：dry-run 的统计和真跑完全一致")
+    chk.ok("跨批次：重复被认出来（跨 500 边界）", "已存在重复 1" in real_text, real_text)
+
+
+async def test_import_lm_limit(main_mod, tmp, chk: Checker) -> None:
+    """--limit N 只读前 N 条。"""
+    lm_path = make_lm_db(os.path.join(tmp, "lm_limit", "livingmemory.db"), lm_rows())
+    h = Harness(main_mod, tmp, db_name="mem_limit.db", rerank=False)
+    text = await h.cmd(f"mem import-lm --path {lm_path} --limit 2")
+    chk.ok("limit：只读 2 条", "读入 2 条" in text, text)
+    chk.ok("limit：报告里说明截断", "--limit 2" in text, text)
+    chk.eq(h.store.stats()["active"], 2, "limit：只进了 2 条")
+
+
 # ── 入口 ───────────────────────────────────────────────────────────────
 
 
@@ -1156,6 +1589,17 @@ async def run_all() -> int:
         await test_consolidate(main_mod, tmp_root, chk)
         await test_migration_from_v02(main_mod, tmp_root, chk)
         await test_mtype_resolution(main_mod, tmp_root, chk)
+        # v0.4.0：从 LivingMemory 搬家
+        test_import_lm_units(main_mod, chk)
+        await test_import_lm_end_to_end(main_mod, tmp_root, chk)
+        await test_import_lm_dry_run(main_mod, tmp_root, chk)
+        await test_import_lm_missing_db(main_mod, tmp_root, chk)
+        test_import_lm_readonly(main_mod, tmp_root, chk)
+        test_import_lm_probe(main_mod, tmp_root, chk)
+        await test_import_lm_missing_columns(main_mod, tmp_root, chk)
+        await test_import_lm_override(main_mod, tmp_root, chk)
+        await test_import_lm_limit(main_mod, tmp_root, chk)
+        await test_import_lm_batch_state(main_mod, tmp_root, chk)
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
 

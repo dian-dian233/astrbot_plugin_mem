@@ -11,6 +11,7 @@
     /mem consolidate [--dry-run]
     /mem export [文件路径]
     /mem import <文件路径>
+    /mem import-lm [--dry-run] [--path <db>] [--limit N]   从 LivingMemory 插件直接搬家
 
 LLM 工具：memory_add / memory_search（`@filter.llm_tool`）。
 
@@ -18,6 +19,9 @@ LLM 工具：memory_add / memory_search（`@filter.llm_tool`）。
 120）字、拒叙事体（`reject_narrative`）、同槽覆盖优先于追加、同主语同义（cos ≥
 `dedupe_threshold`）也走覆盖。检索输出按 (subject, predicate) 只留最新一条，噪声地板
 `min_score`。
+
+搬家（v0.4.0，实现在 livingmemory.py）：`/mem import-lm` 自己找 LivingMemory 的库，
+**只读**打开、切三元组、分批写进来，用户不用导文件。
 
 记忆生命周期（v0.3.0，实现在 lifecycle.py）：每条记录带 mtype / importance / ttl_days /
 decay_type / last_accessed_at / access_count。四种类型 fact(3650d exp) / preference(365d exp) /
@@ -81,7 +85,9 @@ from .lifecycle import (
     normalize_mtype,
     ttl_for,
 )
-from .store import Store, StoreError, resolve_db_path
+from .livingmemory import LivingMemoryError, format_not_found, format_report, probe, run_import
+from .store import Store, StoreError, astrbot_data_dirs, resolve_db_path
+from .textnorm import normalize_text
 
 DEFAULT_MAX_VALUE_LEN = 120  # 单条内容上限（v0.1.0 是硬编码 500，现在可配）
 MAX_VALUE = DEFAULT_MAX_VALUE_LEN  # 兼容旧引用
@@ -98,9 +104,6 @@ SCOPE_FLAG = re.compile(r"(?:^|\s)--scope\s+(\S+)\s*$", re.IGNORECASE)
 
 # 叙事体开头：以这些词开头的 value 是「我昨晚跟他讲了……」这类过程复述，不是事实。
 NARRATIVE_PREFIXES = ("我", "他", "她", "今天", "昨天", "昨晚", "刚才", "后来", "然后")
-
-# 归一化要压掉的空白（全角空格、不换行空格、各类窄空格 + 常规空白）
-_SPACE_CHARS = ("\u3000", "\u00a0", "\u2002", "\u2003", "\u2009", "\u202a", "\u202f")
 
 # 凭证/私钥特征串：命中就拒写（凭证走配置项，不许进记忆库）
 SENSITIVE = re.compile(
@@ -122,6 +125,7 @@ HELP = """长期记忆（所有会话共享同一份）
 /mem consolidate [--dry-run]    同主语 + 语义相近的多条合并成一条（保留最完整）
 /mem export [路径]              导出 JSON（默认 ~/mem-export.json）
 /mem import <路径>              导入并合并（同槽 updated_at 新者胜）
+/mem import-lm [--dry-run]      从 LivingMemory 插件搬家（自动找库，不用你导文件）
 类型：fact 长期 / preference 一年 / event 一个月 / plan 两天（过期不参与检索）
 写操作限管理员 + allowed_users / allowed_groups；读对所有人生效。"""
 
@@ -134,6 +138,7 @@ USAGE = {
     "consolidate": "/mem consolidate [--dry-run]",
     "export": "/mem export [文件路径]",
     "import": "/mem import <文件路径>",
+    "import-lm": "/mem import-lm [--dry-run] [--path <livingmemory.db>] [--limit N]",
 }
 
 MODE_CN = {
@@ -155,17 +160,6 @@ def strip_prefix(text: str) -> str:
     """剥掉 `/mem`、`！记忆` 之类前缀，拿到子指令和参数。"""
     raw = (text or "").strip()
     return CMD_PREFIX.sub("", raw, count=1).strip()
-
-
-def normalize_text(text: str) -> str:
-    """写入归一化：全角/不换行空格→半角，连续空白压成一个，去首尾空白。
-
-    中文标点一律不动（「，。」是用户写法，改了反而检索不到）。
-    """
-    s = str(text or "")
-    for ch in _SPACE_CHARS:
-        s = s.replace(ch, " ")
-    return re.sub(r"\s+", " ", s).strip()
 
 
 def _take_flag(text: str, name: str) -> tuple[str, str]:
@@ -228,6 +222,32 @@ def parse_limit(rest: str, default: int) -> int:
     if not token.isdigit():
         raise ArgError(f"数量要是正整数，收到「{token}」。")
     return max(1, min(100, int(token)))
+
+
+def parse_import_lm(rest: str) -> dict:
+    """`[--dry-run] [--path <db>] [--limit N]` → {"dry_run", "path", "limit"}。
+
+    多余参数直接报错（不静默吞掉）：拼错 `--dryrun` 时用户得知道没生效。
+    """
+    text = str(rest or "").strip()
+    dry_run = bool(re.search(r"(?:^|\s)--dry-run\b", text, re.IGNORECASE))
+    if dry_run:
+        text = re.sub(r"(?:^|\s)--dry-run\b", " ", text, flags=re.IGNORECASE)
+    path, text = _take_flag(text, "path")
+    limit_raw, text = _take_flag(text, "limit")
+    limit = 0
+    if limit_raw:
+        if not limit_raw.isdigit():
+            raise ArgError(f"--limit 要正整数，收到「{limit_raw}」。")
+        limit = int(limit_raw)
+        if limit < 1:
+            raise ArgError("--limit 要 ≥ 1；不限制就别写这个参数。")
+    leftover = text.strip()
+    if leftover:
+        raise ArgError(
+            f"多余的参数「{leftover}」；用法：/mem import-lm [--dry-run] [--path <db>] [--limit N]"
+        )
+    return {"dry_run": dry_run, "path": path, "limit": limit}
 
 
 def validate_fact(
@@ -358,6 +378,11 @@ class MemPlugin(Star):
 
     def _ttl_for(self, mtype: str) -> float:
         return ttl_for(mtype, self._ttl_overrides())
+
+    @staticmethod
+    def _data_dirs() -> list[str]:
+        """AstrBot data 目录候选（只返回存在的），给「找 LivingMemory 的库」用。"""
+        return astrbot_data_dirs()
 
     # -- 存储 --
     def _get_store(self) -> Store:
@@ -689,11 +714,13 @@ class MemPlugin(Star):
             return self._cmd_export(rest, event)
         if action in ("import", "导入"):
             return self._cmd_import(rest, event)
+        if action in ("import-lm", "import_lm", "importlm", "搬家", "迁入"):
+            return self._cmd_import_lm(rest, event)
         if action in ("help", "?", "帮助"):
             return HELP
         raise ArgError(
             f"不认识的子指令「{action}」，可用：add / search / list / forget / stats / "
-            "dedupe / consolidate / export / import。"
+            "dedupe / consolidate / export / import / import-lm。"
         )
 
     # ── 子指令实现 ────────────────────────────────────────────────────
@@ -989,6 +1016,41 @@ class MemPlugin(Star):
         if result["errors"]:
             text += "\n无效示例：" + "；".join(result["errors"])
         return text
+
+    def _cmd_import_lm(self, rest: str, event) -> str:
+        """从 LivingMemory 插件搬家：自己找库、只读打开、切三元组写进来。
+
+        同步跑（和 /mem import 一致）：一次管理操作，几百上千条 sqlite 读写是毫秒级，
+        不值得为它把 handler 改成线程池；`--dry-run` 能在真写之前先看数。
+        """
+        ok, why = self._allow(event, write=True)
+        if not ok:
+            return why
+        opts = parse_import_lm(rest)
+        store = self._get_store()
+        configured = opts["path"] or self._conf_str("lm_db_path")
+        found = probe(self._data_dirs(), configured=configured)
+        if not found["path"]:
+            return format_not_found(found["tried"])
+        logger.info(f"[mem] LivingMemory 搬家：{found['path']}（来源：{found['source']}）")
+        try:
+            result = run_import(
+                store,
+                db_path=found["path"],
+                scope=self._scope(),
+                dry_run=opts["dry_run"],
+                limit=opts["limit"],
+            )
+        except LivingMemoryError as e:
+            logger.warning(f"[mem] LivingMemory 搬家失败：{e}")
+            return f"搬家没成功：{e}\n库里一个字没写，对方的库也没动过。"
+        if not result["dry_run"]:
+            logger.info(
+                f"[mem] 搬家完成：读 {result['read']} 条，导入 "
+                f"{result['added'] + result['updated']} 条（新增 {result['added']} / "
+                f"覆盖 {result['updated']}）"
+            )
+        return format_report(result)
 
     # ── LLM 工具 ──────────────────────────────────────────────────────
     @filter.llm_tool(name="memory_add")

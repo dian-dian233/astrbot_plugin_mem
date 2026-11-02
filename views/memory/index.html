@@ -10,11 +10,11 @@
     --text:#18181B; --text-2:#71717A; --text-3:#A1A1AA;
     --line:#E9EAEC; --hover:#F5F6F7; --focus:#111827;
     --accent:#1F3A32; --accent-soft:#EEF2F0;
-    --fact:#64748B; --event:#5B7F6B; --plan:#A9814A; --pref:#7A6E86;
+    --fact:#4A6A78; --event:#4E7A5E; --plan:#8A6A3A; --pref:#6C5F7A;
     --danger:#B4433A;
     --r-lg:12px; --r-md:8px; --r-sm:6px;
     --sp:4px;
-    --shadow-1:0 1px 2px rgba(24,24,27,.04), 0 1px 1px rgba(24,24,27,.03);
+    --shadow-1:none;
     --shadow-2:0 12px 32px rgba(24,24,27,.10), 0 2px 8px rgba(24,24,27,.06);
   }
   *{box-sizing:border-box}
@@ -67,7 +67,7 @@
   .metrics{display:flex;gap:28px;flex-wrap:wrap}
   .metric{min-width:74px}
   .metric .k{font-size:12px;color:var(--text-2);margin-bottom:2px}
-  .metric .v{font-size:25px;font-weight:600;letter-spacing:-.02em;line-height:1.15;font-variant-numeric:tabular-nums}
+  .metric .v{font-family:ui-serif, Georgia, "Songti SC", serif;font-size:30px;font-weight:500;letter-spacing:-.01em;line-height:1.12;font-variant-numeric:tabular-nums}
   .metric .v small{font-size:12px;font-weight:400;color:var(--text-3);margin-left:4px}
   .split{flex:1;min-width:260px}
   .split .bar{display:flex;height:8px;border-radius:99px;overflow:hidden;background:var(--hover);margin:8px 0 8px}
@@ -184,9 +184,27 @@
   .pager .btn{height:28px;padding:0 10px;font-size:12.5px}
 
   /* ── 关系图 ─────────────────────────── */
-  .graph-wrap{padding:12px 16px 4px}
-  canvas{display:block;width:100%;height:420px}
-  .graph-note{padding:0 16px 14px;font-size:12px;color:var(--text-3)}
+  /* 三段竖排（画布 / 图例 / 注记）都是普通流内元素，谁也不会盖住谁 */
+  .graph-wrap{padding:12px 16px 14px}
+  .graph-stage{position:relative;border:1px solid var(--line);border-radius:var(--r-md);overflow:hidden;background:var(--surface)}
+  canvas{display:block;width:100%}
+  #graph{height:470px;touch-action:none;cursor:grab}
+  #graph.grabbing{cursor:grabbing}
+  /* tooltip 走 DOM 绝对定位，锚在 .graph-stage（position:relative）里 */
+  .graph-tip{
+    position:absolute;left:0;top:0;z-index:2;max-width:264px;pointer-events:none;
+    background:var(--surface);border:1px solid var(--line);border-radius:var(--r-md);
+    box-shadow:var(--shadow-2);padding:7px 10px;font-size:11.5px;line-height:1.55;color:var(--text-2);
+  }
+  .graph-tip[hidden]{display:none}
+  .graph-tip b{display:block;font-size:12px;font-weight:600;color:var(--text);margin-bottom:2px;word-break:break-word}
+  .graph-tip .t-val{word-break:break-word}
+  .graph-tip .t-meta{margin-top:4px;color:var(--text-3);font-variant-numeric:tabular-nums}
+  .graph-legend{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-top:10px;font-size:12px;color:var(--text-2)}
+  .graph-legend span{display:inline-flex;align-items:center;gap:6px}
+  .graph-legend .sw{border-radius:2px}
+  .graph-legend .hint{margin-left:auto;color:var(--text-3)}
+  .graph-note{margin-top:8px;font-size:12px;color:var(--text-3);line-height:1.5}
 
   /* ── 抽屉 ───────────────────────────── */
   .scrim{position:fixed;inset:0;background:rgba(24,24,27,.28);opacity:0;pointer-events:none;transition:opacity .18s ease;z-index:40}
@@ -390,8 +408,20 @@
     </div>
 
     <div id="viewGraph" hidden>
-      <div class="graph-wrap"><canvas id="graph"></canvas></div>
-      <div class="graph-note" id="graphNote">同一个主语的记忆连成一簇，节点大小按重要程度。</div>
+      <div class="graph-wrap">
+        <div class="graph-stage">
+          <canvas id="graph" aria-label="记忆关系图"></canvas>
+          <div class="graph-tip" id="gTip" hidden></div>
+        </div>
+        <div class="graph-legend" id="graphLegend">
+          <span><i class="sw" style="background:var(--fact)"></i>Fact</span>
+          <span><i class="sw" style="background:var(--event)"></i>Event</span>
+          <span><i class="sw" style="background:var(--plan)"></i>Plan</span>
+          <span><i class="sw" style="background:var(--pref)"></i>Preference</span>
+          <span class="hint">滚轮缩放 · 拖拽平移 · 悬停看内容</span>
+        </div>
+        <div class="graph-note" id="graphNote">按主语聚簇，节点大小按重要程度。</div>
+      </div>
     </div>
   </section>
 </div>
@@ -464,7 +494,7 @@
 
   var API = "/api/plug/astrbot_plugin_mem/mem-api";
   var TYPE_LABEL = { fact: "Fact", event: "Event", plan: "Plan", preference: "Preference" };
-  var TYPE_COLOR = { fact: "#64748B", event: "#5B7F6B", plan: "#A9814A", preference: "#7A6E86" };
+  var TYPE_COLOR = { fact: "#4A6A78", event: "#4E7A5E", plan: "#8A6A3A", preference: "#6C5F7A" };
 
   var state = { q: "", type: "", origin: "", sort: "updated_desc", limit: 20, offset: 0, total: 0, items: [], loading: false, view: "table" };
   var current = null;
@@ -763,18 +793,82 @@
     } catch (e) { toast("作废失败：" + e.message, true); }
   }
 
-  /* ── 关系图 ───────────────────────────── */
+  /* ── 关系图（簇星图）───────────────────── */
   var graphData = null;
+  var graphModel = null;                  // { layout, w, h }
+  var graphView = { k: 1, tx: 0, ty: 0 }; // 缩放倍数 + 平移量（屏幕像素）
+  var graphDrag = null;
+  var GRAPH_CLUSTER_MAX = 16;   // 只画条数最多的 16 组主语
+  var GRAPH_CLUSTER_R = 200;    // 簇心均分在这个半径的圆上（逻辑像素）
+  var GRAPH_MEMBER_MAX = 4;     // 每簇最多 4 个记忆点
+  var GRAPH_LINK_MAX = 60;      // 簇心→成员超过 60px 就不连线
+  var GRAPH_HIT = 14;           // 悬停命中半径（屏幕像素）
+  var GRAPH_HEART = "#1D4B45";
+  var GRAPH_LINK = "rgba(24,24,27,.10)";
+  var GRAPH_GRID = "rgba(24,24,27,.035)";
 
   async function loadGraph() {
     try {
       var d = await api(ACT + "graph");
       graphData = d;
+      graphView = { k: 1, tx: 0, ty: 0 };
+      hideGraphTip();
       drawGraph();
-      var n = (d.nodes || []).length;
-      $("graphNote").textContent = (d.truncated ? "记忆较多，只画了前 " + n + " 个节点。" : n + " 个节点。") +
-        "同一个主语的记忆连成一簇，节点大小按重要程度。";
-    } catch (e) { $("graphNote").textContent = "关系图加载失败：" + e.message; }
+    } catch (e) {
+      graphModel = null;
+      hideGraphTip();
+      $("graphNote").textContent = "关系图加载失败：" + e.message;
+    }
+  }
+
+  /* 簇星图布局：按 subject 聚簇 → 取条数最多的 16 组 → 簇心均分圆周 → 簇内最多 4 个成员点 */
+  function graphLayout(nodes, w, h) {
+    var bySubject = {};
+    (nodes || []).forEach(function (n) {
+      var key = n.subject || n.label || "?";
+      (bySubject[key] = bySubject[key] || []).push(n);
+    });
+    var groups = Object.keys(bySubject).map(function (k) {
+      var list = bySubject[k].slice().sort(function (a, b) {
+        return (Number(b.importance) || 0) - (Number(a.importance) || 0) || (a.id - b.id);
+      });
+      return { subject: k, total: list.length, members: list.slice(0, GRAPH_MEMBER_MAX) };
+    }).sort(function (a, b) {
+      return b.total - a.total || (a.subject < b.subject ? -1 : 1);
+    });
+
+    var shown = groups.slice(0, GRAPH_CLUSTER_MAX);
+    var cx = w / 2, cy = h / 2;
+    // 目标半径 200，但要给簇标签（下方 ~24px）和窄屏留边，取宽高双约束
+    var ring = Math.max(60, Math.min(GRAPH_CLUSTER_R, w / 2 - 46, h / 2 - 36));
+    var drawn = 0;
+    shown.forEach(function (g, i) {
+      var a = (i / Math.max(shown.length, 1)) * Math.PI * 2 - Math.PI / 2;
+      g.x = cx + Math.cos(a) * ring;
+      g.y = cy + Math.sin(a) * ring;
+      var m = g.members.length;
+      g.members.forEach(function (n, j) {
+        // 成员朝「圆心方向」扇形展开（±39°），把外侧一圈让给簇标签，免得标签压在点上
+        var ma = a + Math.PI + (j - (m - 1) / 2) * (26 * Math.PI / 180);
+        var mr = 30;
+        n.x = g.x + Math.cos(ma) * mr;
+        n.y = g.y + Math.sin(ma) * mr;
+        drawn += 1;
+      });
+    });
+    return { groups: shown, groupCount: groups.length, drawn: drawn, cx: cx, cy: cy, ring: ring };
+  }
+
+  /* 画布底下铺一层 40px 极淡网格，给「档案纸」一点经纬感 */
+  function drawGraphGrid(ctx, w, h) {
+    ctx.save();
+    ctx.strokeStyle = GRAPH_GRID;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (var x = 0.5; x < w; x += 40) { ctx.moveTo(x, 0); ctx.lineTo(x, h); }
+    for (var y = 0.5; y < h; y += 40) { ctx.moveTo(0, y); ctx.lineTo(w, y); }
+    ctx.stroke();
+    ctx.restore();
   }
 
   function drawGraph() {
@@ -782,73 +876,211 @@
     if (!cv || !cv.clientWidth) return;
     var dpr = window.devicePixelRatio || 1;
     var w = cv.clientWidth, h = cv.clientHeight;
-    cv.width = w * dpr; cv.height = h * dpr;
+    cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr);
     var ctx = cv.getContext("2d");
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, w, h);
-    if (!graphData) return;
+    drawGraphGrid(ctx, w, h);
 
-    var nodes = graphData.nodes || [], edges = graphData.edges || [];
-    if (!nodes.length) { $("graphNote").textContent = "还没有可画的记忆。"; return; }
+    var nodes = (graphData && graphData.nodes) || [];
+    if (!nodes.length) {
+      graphModel = null;
+      if (graphData) $("graphNote").textContent = "还没有可画的记忆。";
+      return;
+    }
 
-    var pos = {};
-    var bySubject = {};
-    nodes.forEach(function (n) {
-      var key = n.subject || n.label || "?";
-      (bySubject[key] = bySubject[key] || []).push(n);
-    });
-    var keys = Object.keys(bySubject);
-    var cx = w / 2, cy = h / 2, R = Math.min(w, h) * 0.36;
-    keys.forEach(function (k, i) {
-      var a = (i / Math.max(keys.length, 1)) * Math.PI * 2 - Math.PI / 2;
-      var hx = cx + Math.cos(a) * R, hy = cy + Math.sin(a) * R;
-      var group = bySubject[k];
-      group.forEach(function (n, j) {
-        var aa = (j / Math.max(group.length, 1)) * Math.PI * 2;
-        var r = 22 + group.length * 1.5;
-        pos[n.id] = { x: hx + Math.cos(aa) * r, y: hy + Math.sin(aa) * r };
-      });
-    });
+    var layout = graphLayout(nodes, w, h);
+    graphModel = { layout: layout, w: w, h: h };
 
-    ctx.strokeStyle = "#E3E5E8"; ctx.lineWidth = 1;
+    ctx.save();
+    ctx.translate(graphView.tx, graphView.ty);
+    ctx.scale(graphView.k, graphView.k);
+
+    // 1) 簇心 → 成员：极细连线，超过 60px 直接不画，免得又糊成一团
+    ctx.strokeStyle = GRAPH_LINK;
+    ctx.lineWidth = 0.8 / graphView.k;
     ctx.beginPath();
-    edges.forEach(function (e) {
-      var a = pos[e.source], b = pos[e.target];
-      if (a && b) { ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); }
+    layout.groups.forEach(function (g) {
+      g.members.forEach(function (n) {
+        if (Math.hypot(n.x - g.x, n.y - g.y) > GRAPH_LINK_MAX) return;
+        ctx.moveTo(g.x, g.y); ctx.lineTo(n.x, n.y);
+      });
     });
     ctx.stroke();
 
-    nodes.forEach(function (n) {
-      var p = pos[n.id]; if (!p) return;
-      var imp = Math.max(0, Math.min(1, Number(n.importance) || 0));
-      var r = 2.5 + imp * 4.5;
-      ctx.beginPath();
-      ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
-      ctx.fillStyle = TYPE_COLOR[n.mtype] || "#9AA0A8";
-      ctx.fill();
-    });
-
-    cv.onmousemove = function (ev) {
-      var rect = cv.getBoundingClientRect();
-      var mx = ev.clientX - rect.left, my = ev.clientY - rect.top;
-      var best = null, bestD = 12;
-      nodes.forEach(function (n) {
-        var p = pos[n.id]; if (!p) return;
-        var dd = Math.hypot(p.x - mx, p.y - my);
-        if (dd < bestD) { bestD = dd; best = n; }
+    // 2) 成员点：颜色按 mtype，半径 3 + importance*3.4
+    layout.groups.forEach(function (g) {
+      g.members.forEach(function (n) {
+        var imp = Math.max(0, Math.min(1, Number(n.importance) || 0));
+        ctx.beginPath();
+        ctx.arc(n.x, n.y, 3 + imp * 3.4, 0, Math.PI * 2);
+        ctx.fillStyle = TYPE_COLOR[n.mtype] || "#9AA0A8";
+        ctx.fill();
       });
-      $("graphNote").textContent = best
-        ? ((best.subject || "") + " · " + String(best.value || "").slice(0, 60))
-        : (nodes.length + " 个节点。同一个主语的记忆连成一簇，节点大小按重要程度。");
-    };
-
-    keys.forEach(function (k, i) {
-      var a = (i / Math.max(keys.length, 1)) * Math.PI * 2 - Math.PI / 2;
-      var x = cx + Math.cos(a) * R, y = cy + Math.sin(a) * R;
-      ctx.fillStyle = "#71717A"; ctx.font = "11px system-ui"; ctx.textAlign = "center";
-      ctx.fillText(String(k).slice(0, 10), x, y - 16);
     });
+
+    // 3) 簇心：4px 实心点 + 外圈 8px 细环
+    layout.groups.forEach(function (g) {
+      ctx.beginPath();
+      ctx.arc(g.x, g.y, 4, 0, Math.PI * 2);
+      ctx.fillStyle = GRAPH_HEART;
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(g.x, g.y, 8, 0, Math.PI * 2);
+      ctx.strokeStyle = GRAPH_HEART;
+      ctx.lineWidth = 1 / graphView.k;
+      ctx.stroke();
+    });
+
+    // 4) 标签「主语 · 条数」+ 余量 +N：整块沿半径外扩，内部一律「先标签后 +N」
+    //    先用白底片垫一下再写字，避免邻近簇的点穿过字身
+    var gcx = layout.cx, gcy = layout.cy, ring = layout.ring;
+    ctx.textBaseline = "middle";
+    ctx.font = '500 11px -apple-system, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif';
+    layout.groups.forEach(function (g) {
+      var a = Math.atan2(g.y - gcy, g.x - gcx);
+      var cosA = Math.cos(a);
+      var align = cosA > 0.35 ? "left" : (cosA < -0.35 ? "right" : "center");
+      var name = String(g.subject);
+      if (name.length > 10) name = name.slice(0, 10) + "…";
+      var label = name + " · " + g.total;
+      var extra = g.total - g.members.length;
+      var plus = extra > 0 ? "+" + extra : "";
+      var wl = ctx.measureText(label).width;
+      var wp = plus ? ctx.measureText(plus).width : 0;
+      var gap = plus ? 6 : 0;
+      var bw = wl + gap + wp;
+      var lx = gcx + Math.cos(a) * (ring + 26);
+      var ly = gcy + Math.sin(a) * (ring + 26);
+      var x0 = align === "left" ? lx : (align === "right" ? lx - bw : lx - bw / 2);
+      var y0 = ly - 7;
+
+      ctx.fillStyle = "rgba(255,255,255,.86)";
+      ctx.fillRect(x0 - 3, y0, bw + 6, 14);
+      ctx.textAlign = "left";
+      ctx.fillStyle = "#3F3F46";
+      ctx.fillText(label, x0, ly);
+      if (plus) {
+        ctx.fillStyle = "#A1A1AA";
+        ctx.fillText(plus, x0 + wl + gap, ly);
+      }
+    });
+
+    ctx.restore();
+
+    var total = Number(graphData.total_nodes || nodes.length) || nodes.length;
+    var folded = Math.max(0, total - layout.drawn);
+    var groupCount = Number(graphData.subjects || layout.groupCount) || layout.groupCount;
+    var note = total + " 条记忆归到 " + groupCount + " 组主语，另有 " + folded + " 条折叠";
+    if (graphData.truncated) {
+      note += "（接口只返回前 " + (Number(graphData.max_nodes) || nodes.length) + " 条，按重要程度取样）";
+    }
+    $("graphNote").textContent = note;
   }
+
+  function graphToLogical(mx, my) {
+    return { x: (mx - graphView.tx) / graphView.k, y: (my - graphView.ty) / graphView.k };
+  }
+
+  /* 悬停命中：先找 14px 内的成员点，再找簇心 */
+  function graphHit(mx, my) {
+    if (!graphModel) return null;
+    var p = graphToLogical(mx, my);
+    var tol = GRAPH_HIT / graphView.k;
+    var best = null, bestD = tol;
+    graphModel.layout.groups.forEach(function (g) {
+      g.members.forEach(function (n) {
+        var d = Math.hypot(n.x - p.x, n.y - p.y);
+        if (d <= bestD) { bestD = d; best = { kind: "node", node: n }; }
+      });
+    });
+    if (best) return best;
+    graphModel.layout.groups.forEach(function (g) {
+      var d = Math.hypot(g.x - p.x, g.y - p.y);
+      if (d <= tol) { tol = d; best = { kind: "group", group: g }; }
+    });
+    return best;
+  }
+
+  function hideGraphTip() {
+    var tip = $("gTip");
+    if (tip) tip.hidden = true;
+  }
+
+  /* tooltip 是 DOM，绝对定位挂在 .graph-stage 里（画布父节点），不用 canvas 画字 */
+  function showGraphTip(ev, hit) {
+    var tip = $("gTip");
+    if (!tip || !tip.parentNode) return;
+    if (hit.kind === "node") {
+      var n = hit.node;
+      tip.innerHTML = "<b>" + esc(n.subject || "") + " · " + esc(n.predicate || "") + "</b>" +
+        '<div class="t-val">' + esc(String(n.value == null ? "" : n.value).slice(0, 60)) + "</div>" +
+        '<div class="t-meta">' + esc(TYPE_LABEL[n.mtype] || n.mtype || "未知") +
+        " · 权重 " + (Number(n.importance) || 0).toFixed(2) + "</div>";
+    } else {
+      var g = hit.group;
+      tip.innerHTML = "<b>" + esc(g.subject) + "</b>" +
+        '<div class="t-meta">这一簇共 ' + g.total + " 条记忆</div>";
+    }
+    tip.hidden = false;
+
+    var stage = tip.parentNode;
+    var r = stage.getBoundingClientRect();
+    var x = ev.clientX - r.left + 14, y = ev.clientY - r.top + 14;
+    var tw = tip.offsetWidth, th = tip.offsetHeight;
+    if (x + tw > r.width - 8) x = ev.clientX - r.left - tw - 14;
+    if (y + th > r.height - 8) y = ev.clientY - r.top - th - 14;
+    tip.style.left = Math.max(6, x) + "px";
+    tip.style.top = Math.max(6, y) + "px";
+  }
+
+  function bindGraph() {
+    var cv = $("graph");
+    if (!cv) return;
+
+    cv.addEventListener("wheel", function (ev) {
+      if (!graphModel) return;
+      ev.preventDefault();
+      var k0 = graphView.k;
+      var k1 = Math.min(3, Math.max(0.5, k0 * (ev.deltaY < 0 ? 1.15 : 1 / 1.15)));
+      if (k1 === k0) return;
+      var r = cv.getBoundingClientRect();
+      var px = ev.clientX - r.left, py = ev.clientY - r.top;
+      graphView.tx = px - (px - graphView.tx) * (k1 / k0);
+      graphView.ty = py - (py - graphView.ty) * (k1 / k0);
+      graphView.k = k1;
+      hideGraphTip();
+      drawGraph();
+    }, { passive: false });
+
+    cv.addEventListener("pointerdown", function (ev) {
+      if (!graphModel) return;
+      graphDrag = { x: ev.clientX, y: ev.clientY, tx: graphView.tx, ty: graphView.ty };
+      cv.classList.add("grabbing");
+      hideGraphTip();
+      if (cv.setPointerCapture) { try { cv.setPointerCapture(ev.pointerId); } catch (e) {} }
+    });
+
+    cv.addEventListener("pointermove", function (ev) {
+      if (graphDrag) {
+        graphView.tx = graphDrag.tx + (ev.clientX - graphDrag.x);
+        graphView.ty = graphDrag.ty + (ev.clientY - graphDrag.y);
+        hideGraphTip();
+        drawGraph();
+        return;
+      }
+      var r = cv.getBoundingClientRect();
+      var hit = graphHit(ev.clientX - r.left, ev.clientY - r.top);
+      if (hit) showGraphTip(ev, hit); else hideGraphTip();
+    });
+
+    function endDrag() { graphDrag = null; cv.classList.remove("grabbing"); }
+    cv.addEventListener("pointerup", endDrag);
+    cv.addEventListener("pointercancel", endDrag);
+    cv.addEventListener("pointerleave", function () { endDrag(); hideGraphTip(); });
+  }
+
+  bindGraph();
 
   /* ── 新增 ─────────────────────────────── */
   function setErr(input, msg) {

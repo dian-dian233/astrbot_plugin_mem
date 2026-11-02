@@ -303,6 +303,10 @@ def build_graph(rows: Iterable[Mapping[str, Any]], max_nodes: int = GRAPH_MAX_NO
 
     节点按 importance 降序、id 升序取前 `max_nodes` 个；超了置 `truncated=True`，
     前端据此提示「只画了前 N 个」。边只连已画出的节点，避免悬空引用。
+
+    每个节点额外带 `subject` / `predicate`：前端要按 subject 聚簇（v0.8.1 的簇星图）
+    和悬停显示「主语 · 谓词」，只靠 `label` 拆字符串会把主语拆错。
+    `subjects` 是**全部有效行**的主语组数，不受 max_nodes 截断影响。
     """
     shaped = [shape_item(row) for row in rows]
     total = len(shaped)
@@ -329,6 +333,8 @@ def build_graph(rows: Iterable[Mapping[str, Any]], max_nodes: int = GRAPH_MAX_NO
     nodes = [
         {
             "id": node["id"],
+            "subject": node["subject"] or f"#{node['id']}",
+            "predicate": node["predicate"],
             "label": f"{node['subject']} · {node['predicate']}".strip(" ·"),
             "mtype": node["mtype"],
             "importance": node["importance"],
@@ -336,11 +342,14 @@ def build_graph(rows: Iterable[Mapping[str, Any]], max_nodes: int = GRAPH_MAX_NO
         }
         for node in sorted(kept, key=lambda item: item["id"])
     ]
+    # 前端按 subject 聚簇，「几组主语」要按**全部有效行**算，而不是只数被画出来的那 300 条
+    all_subjects = {item["subject"] or f"#{item['id']}" for item in shaped}
     return {
         "nodes": nodes,
         "edges": edges,
         "total_nodes": total,
         "shown_nodes": len(nodes),
+        "subjects": len(all_subjects),
         "truncated": total > len(nodes),
         "max_nodes": int(max_nodes),
     }

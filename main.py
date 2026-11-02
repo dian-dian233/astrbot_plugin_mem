@@ -233,7 +233,14 @@ def parse_import_lm(rest: str) -> dict:
     dry_run = bool(re.search(r"(?:^|\s)--dry-run\b", text, re.IGNORECASE))
     if dry_run:
         text = re.sub(r"(?:^|\s)--dry-run\b", " ", text, flags=re.IGNORECASE)
-    path, text = _take_flag(text, "path")
+    # 路径带空格时允许加引号（Windows 的 "C:\Program Files\..." 之类），
+    # 只在这个子指令里认引号，不动 _take_flag（--scope / --type 的行为要保持不变）。
+    quoted = re.search(r'(?:^|\s)--path(?:=|\s+)"([^"]+)"', text)
+    if quoted:
+        path = quoted.group(1).strip()
+        text = f"{text[: quoted.start()]} {text[quoted.end():]}"
+    else:
+        path, text = _take_flag(text, "path")
     limit_raw, text = _take_flag(text, "limit")
     limit = 0
     if limit_raw:

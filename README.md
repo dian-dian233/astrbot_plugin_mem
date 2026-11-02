@@ -229,6 +229,7 @@ global|点点 → 保留 #17（合并 2 条，importance 0.80，access 6）
 /mem import-lm --dry-run                    # 只统计，一个字不写
 /mem import-lm --limit 200                  # 先搬 200 条试试水
 /mem import-lm --path /app/data/plugin_data/astrbot_plugin_livingmemory/livingmemory.db
+/mem import-lm --path "C:\Program Files\AstrBot\data\plugin_data\astrbot_plugin_livingmemory\livingmemory.db"
 ```
 
 出来是一条消息（不刷屏）：
@@ -446,7 +447,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 selftest.py --offline
 期望输出最后一行：
 
 ```
-306/306 通过
+308/308 通过
 ```
 
 覆盖：add→search、同槽覆盖、forget、超长/敏感词、库损坏、白/黑名单、注入开关、
@@ -458,7 +459,7 @@ v0.2.0 新增（39 条）：120/121 字边界、叙事体拒写、归一化（�
 `dedupe_threshold=0` 关闭）、检索 `(主语,谓词)` 去重 + 更新时间展示 + 作废标注、
 `min_score` 双阈值对比、`/mem dedupe` 的 dry-run 与真跑、注入按主语去重 + `inject_char_cap` 裁剪。
 
-v0.4.0 新增（102 条）：假的 `livingmemory.db`（schema 照抄对方 `storage/atom_store.py`）端到端搬家、
+v0.4.0 新增（104 条）：假的 `livingmemory.db`（schema 照抄对方 `storage/atom_store.py`）端到端搬家、
 切分规则（长谓词优先 / 1<idx≤24 / 长叙事退回整体）、atom_type 与 decay_type 映射、epoch↔ISO 转换、
 `status != active` 跳过、内容重复跳过、同槽新者胜 + 旧的不许盖新的、`--dry-run` 不改库、
 `--limit` 截断、缺列（只有 id/content/importance）也能导入、只读句柄写不进去、

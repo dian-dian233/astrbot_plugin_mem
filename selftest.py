@@ -1290,6 +1290,10 @@ def test_import_lm_units(main_mod, chk: Checker) -> None:
            {"dry_run": True, "path": "", "limit": 0}, "解析：--dry-run")
     chk.eq(main_mod.parse_import_lm("--path /tmp/lm.db --limit 10 --dry-run"),
            {"dry_run": True, "path": "/tmp/lm.db", "limit": 10}, "解析：三个参数一起")
+    chk.eq(main_mod.parse_import_lm('--path "/app/Program Files/livingmemory.db"')["path"],
+           "/app/Program Files/livingmemory.db", "解析：路径带空格可以加引号")
+    chk.eq(main_mod.parse_import_lm('--path "/a b/lm.db" --dry-run'),
+           {"dry_run": True, "path": "/a b/lm.db", "limit": 0}, "解析：引号路径 + 其它参数")
     for bad in ("--limit 0", "--limit abc", "--dryrun", "--path"):
         try:
             main_mod.parse_import_lm(bad)

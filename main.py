@@ -15,6 +15,9 @@
 
 LLM 工具：memory_add / memory_search（`@filter.llm_tool`）。
 
+WebUI（v0.6.0）：`views/memory/index.html` 管理页 + `/<插件名>/mem-api/*` 七个接口，
+路由在 `initialize()` 里注册。参数校验与关系图布局在 `core/webapi.py`（纯标准库）。
+
 写入降噪（v0.2.0，规范见 dd-home/memory-policy.md）：一句判断句、≤`max_value_len`（默认
 120）字、拒叙事体（`reject_narrative`）、同槽覆盖优先于追加、同主语同义（cos ≥
 `dedupe_threshold`）也走覆盖。检索输出按 (subject, predicate) 只留最新一条，噪声地板
@@ -58,6 +61,7 @@ API 出处（都已 grep 过 AstrBot 4.29.3 源码，不凭记忆）：
 from __future__ import annotations
 
 import asyncio
+import functools
 import os
 import re
 from datetime import datetime
@@ -66,6 +70,16 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
+
+# WebUI 桥接层：只有带插件页面能力的核心才有 `astrbot.api.web`。
+# 老核心上导入失败就退化成「只有指令」，绝不因为 WebUI 把插件加载搞挂。
+try:  # pragma: no cover - 真核心的分支
+    from astrbot.api.web import error_response, json_response
+    from astrbot.api.web import request as web_request
+except ImportError:  # pragma: no cover - 老核心 / 单测桩缺模块
+    error_response = None
+    json_response = None
+    web_request = None
 
 # 双写兜底：AstrBot 按包导入插件（`.core.x`）；直接跑 / 平铺加载时走 `core.x`。
 try:
@@ -90,6 +104,7 @@ try:
     from .core.livingmemory import LivingMemoryError, format_not_found, format_report, probe, run_import
     from .core.store import Store, StoreError, astrbot_data_dirs, resolve_db_path
     from .core.textnorm import normalize_text
+    from .core import webapi as web_api
 except ImportError:  # pragma: no cover - 只在平铺加载时命中
     from core.retrieve import (
         EMBED_TIMEOUT,
@@ -112,6 +127,7 @@ except ImportError:  # pragma: no cover - 只在平铺加载时命中
     from core.livingmemory import LivingMemoryError, format_not_found, format_report, probe, run_import
     from core.store import Store, StoreError, astrbot_data_dirs, resolve_db_path
     from core.textnorm import normalize_text
+    from core import webapi as web_api
 
 DEFAULT_MAX_VALUE_LEN = 120  # 单条内容上限（v0.1.0 是硬编码 500，现在可配）
 MAX_VALUE = DEFAULT_MAX_VALUE_LEN  # 兼容旧引用
@@ -352,6 +368,34 @@ def format_row(row: dict, *, with_score: bool = False) -> str:
 
 
 # ── 插件 ───────────────────────────────────────────────────────────────
+
+
+def _web_guard(fn):
+    """Web API 统一异常出口：参数问题 400，库坏了 500，其它 500 —— 都带中文提示。
+
+    放在模块级而不是类里：`@_web_guard` 在类体执行时取到的是 staticmethod 对象，
+    Python 3.9 上它不可调用（3.10+ 才行）。模块级函数最稳。
+
+    界面永远能拿到 `{status, message, data}`，不会出现空响应或 traceback。
+    """
+
+    @functools.wraps(fn)
+    async def wrapper(self):
+        try:
+            return await fn(self)
+        except web_api.WebApiError as e:
+            return self._web_fail(e.message, status_code=e.status_code)
+        except StoreError as e:
+            logger.warning(f"[mem] WebUI 记忆库异常：{e}")
+            return self._web_fail(f"记忆库读不了：{e}", status_code=500)
+        except Exception as e:  # noqa: BLE001 页面接口不许抛 traceback
+            logger.warning(f"[mem] WebUI 接口异常 {fn.__name__}：{type(e).__name__}: {e}")
+            return self._web_fail(
+                f"接口出错了（{type(e).__name__}），已记日志；不影响其它功能。",
+                status_code=500,
+            )
+
+    return wrapper
 
 
 class MemPlugin(Star):
@@ -920,6 +964,31 @@ class MemPlugin(Star):
             clusters.extend([g for g in groups if len(g) > 1])
         return clusters
 
+    @staticmethod
+    def _plan_consolidation(clusters: list[list[dict]]) -> list[dict]:
+        """簇 → 合并计划（keeper + 待作废行）。指令和 WebUI 共用这一份。"""
+        plans = []
+        for cluster in clusters:
+            keeper = max(
+                cluster,
+                key=lambda r: (
+                    len(str(r.get("value") or "")),
+                    str(r.get("updated_at") or ""),
+                    int(r.get("id") or 0),
+                ),
+            )
+            plans.append(
+                {
+                    "keeper": keeper,
+                    "drop": [r for r in cluster if int(r["id"]) != int(keeper["id"])],
+                    "importance": max(
+                        float(r.get("importance") or 0.0) for r in cluster
+                    ),
+                    "access_count": sum(int(r.get("access_count") or 0) for r in cluster),
+                }
+            )
+        return plans
+
     async def _cmd_consolidate(self, rest: str, event) -> str:
         tokens = [t for t in (rest or "").split() if t]
         dry_run = any(t in ("--dry-run", "--dry", "-n") for t in tokens)
@@ -945,26 +1014,7 @@ class MemPlugin(Star):
                 return head + "\n（dedupe_threshold=0，只合并一字不差的值）没有可合并的记录。"
             return head + "\n库里没有同 scope + 同主语且语义相近的记录。"
 
-        plans = []
-        for cluster in clusters:
-            keeper = max(
-                cluster,
-                key=lambda r: (
-                    len(str(r.get("value") or "")),
-                    str(r.get("updated_at") or ""),
-                    int(r.get("id") or 0),
-                ),
-            )
-            plans.append(
-                {
-                    "keeper": keeper,
-                    "drop": [r for r in cluster if int(r["id"]) != int(keeper["id"])],
-                    "importance": max(
-                        float(r.get("importance") or 0.0) for r in cluster
-                    ),
-                    "access_count": sum(int(r.get("access_count") or 0) for r in cluster),
-                }
-            )
+        plans = self._plan_consolidation(clusters)
 
         def summarize(plan) -> str:
             keeper = plan["keeper"]
@@ -1205,3 +1255,163 @@ class MemPlugin(Star):
             req.system_prompt = f"{prompt}\n\n[长期记忆（可能过期，仅供参考）]\n{block}".lstrip()
         except Exception as e:  # noqa: BLE001 注入失败绝不能打断聊天
             logger.warning(f"[mem] 记忆注入失败，本轮跳过：{type(e).__name__}: {e}")
+
+    # ══ WebUI 管理页 API（前缀 /<插件名>/mem-api/）═══════════════════════
+    #
+    # 路由必须自带插件名：dashboard 收到 `AstrBotPluginView.apiGet("mem-api/list")`
+    # 后拼成 `/api/v1/plugins/extensions/<插件名>/mem-api/list`，再拿
+    # `<插件名>/mem-api/list` 去匹配注册表（dashboard/src/views/PluginViewPage.vue:122-125
+    # → astrbot/dashboard/api/plugins.py:209 _match_registered_web_api）。
+    # 所以这里注册的是 `/<插件名>/mem-api/<动作>`，不是裸 `/mem-api/<动作>`。
+    WEB_API_ACTION = "mem-api"
+
+    def _web_route(self, action: str) -> str:
+        plugin_name = (getattr(self, "name", "") or "astrbot_plugin_mem").strip("/")
+        return f"/{plugin_name}/{self.WEB_API_ACTION}/{action}"
+
+    async def initialize(self) -> None:
+        """插件激活时注册 WebUI 路由。核心不支持就静默跳过（指令功能不受影响）。"""
+        register = getattr(self.context, "register_web_api", None)
+        if json_response is None or not callable(register):
+            logger.info("[mem] 当前核心不支持插件 Web 页面 API，跳过 WebUI 注册")
+            return
+        routes = [
+            ("list", self._web_list, ["GET"], "记忆列表（分页 + 搜索 + 类型过滤）"),
+            ("stats", self._web_stats, ["GET"], "记忆库统计 + provider 状态"),
+            ("add", self._web_add, ["POST"], "新增一条事实"),
+            ("forget", self._web_forget, ["POST"], "按 id 作废一条记忆"),
+            ("dedupe", self._web_dedupe, ["POST"], "同槽去重（支持 dry_run）"),
+            ("consolidate", self._web_consolidate, ["POST"], "同主语语义合并（支持 dry_run）"),
+            ("graph", self._web_graph, ["GET"], "关系图节点 / 边"),
+        ]
+        for action, handler, methods, desc in routes:
+            register(self._web_route(action), handler, methods, desc)
+        logger.info(f"[mem] WebUI 已注册 {len(routes)} 个接口：{self._web_route('')}*")
+
+    @staticmethod
+    def _web_ok(data) -> object:
+        return json_response({"status": "ok", "message": "", "data": data})
+
+    @staticmethod
+    def _web_fail(message: str, *, status_code: int = 400) -> object:
+        return error_response(message, status_code=status_code)
+
+    def _embed_status(self) -> dict:
+        """provider 卡的数据：拿不到就算不可用，绝不抛。"""
+        try:
+            pid, prov = self._embed_provider()
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "id": "", "model": f"不可用（{type(e).__name__}）"}
+        if prov is None:
+            return {"ok": False, "id": pid or "", "model": ""}
+        return {
+            "ok": True,
+            "id": pid or self._provider_id(prov),
+            "model": self._model_name(prov),
+        }
+
+    async def _read_json_body(self) -> dict:
+        if web_request is None:  # pragma: no cover - 注册成功就不会走到
+            raise web_api.WebApiError("当前核心不支持插件 Web API")
+        payload = await web_request.json(default={})
+        if payload is None:
+            return {}
+        if not isinstance(payload, dict):
+            raise web_api.WebApiError("请求体要是 JSON 对象")
+        return payload
+
+    @_web_guard
+    async def _web_list(self):
+        rows = self._get_store().active_rows()
+        return self._web_ok(web_api.build_list(rows, web_request.query))
+
+    @_web_guard
+    async def _web_stats(self):
+        store = self._get_store()
+        pid, prov = self._embed_provider()
+        model_key = self._model_key(pid, prov) if prov is not None else ""
+        st = store.stats(model=model_key or None)
+        return self._web_ok(web_api.build_stats(st, self._embed_status()))
+
+    @_web_guard
+    async def _web_add(self):
+        fields = web_api.parse_add_payload(await self._read_json_body())
+        problem = self._validate(fields["subject"], fields["predicate"], fields["value"])
+        if problem:  # 和指令同一条校验：超长 / 叙事体 / 空值都在这拦
+            raise web_api.WebApiError(problem)
+        if fields["mtype"]:
+            mtype = normalize_mtype(fields["mtype"])
+        else:
+            mtype = infer_mtype(
+                fields["subject"],
+                fields["predicate"],
+                fields["value"],
+                self._conf_str("default_mtype") or DEFAULT_MTYPE,
+            )
+        target = fields["scope"] or self._scope()
+        result = await self._write_fact(
+            target,
+            fields["subject"],
+            fields["predicate"],
+            fields["value"],
+            source="webui",
+            mtype=mtype,
+            importance=fields["importance"],
+        )
+        return self._web_ok(
+            {
+                "id": int(result["id"]),
+                "superseded": [int(i) for i in result.get("superseded") or []],
+                "scope": target,
+                "mtype": mtype,
+                "item": web_api.shape_item(result.get("row") or {}),
+            }
+        )
+
+    @_web_guard
+    async def _web_forget(self):
+        mem_id = web_api.parse_id_payload(await self._read_json_body())
+        rows = self._get_store().forget_ids([mem_id])
+        if not rows:
+            raise web_api.WebApiError(
+                f"没有找到编号 {mem_id} 的有效记忆（可能已经作废了）", status_code=404
+            )
+        return self._web_ok({"id": mem_id, "forgotten": len(rows)})
+
+    @_web_guard
+    async def _web_dedupe(self):
+        dry_run = web_api.parse_bool(
+            (await self._read_json_body()).get("dry_run"), default=False, label="dry_run"
+        )
+        report = self._get_store().dedupe_slots(dry_run=dry_run)
+        return self._web_ok(web_api.summarize_dedupe(report))
+
+    @_web_guard
+    async def _web_consolidate(self):
+        dry_run = web_api.parse_bool(
+            (await self._read_json_body()).get("dry_run"), default=False, label="dry_run"
+        )
+        store = self._get_store()
+        rows = store.active_rows()
+        threshold = self._conf_float("dedupe_threshold", DEFAULT_DEDUPE_THRESHOLD)
+        # 聚类和计划完全复用指令那条路径（_consolidation_clusters / _plan_consolidation）
+        clusters = await self._consolidation_clusters(store, rows, threshold)
+        plans = self._plan_consolidation(clusters)
+        if not dry_run:
+            for plan in plans:
+                store.merge_rows(
+                    int(plan["keeper"]["id"]),
+                    [int(r["id"]) for r in plan["drop"]],
+                    importance=plan["importance"],
+                    access_count=plan["access_count"],
+                )
+        return self._web_ok(
+            web_api.summarize_consolidate(
+                plans, scanned=len(rows), dry_run=dry_run, threshold=threshold
+            )
+        )
+
+    @_web_guard
+    async def _web_graph(self):
+        rows = self._get_store().active_rows()
+        return self._web_ok(web_api.build_graph(rows))

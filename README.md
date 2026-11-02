@@ -45,6 +45,8 @@ AstrBot 自带的长期记忆有两个毛病，用久了很明显。
 
 换个群再搜一次——搜得到，就说明跨会话通了。
 
+**看**：控制台 → 插件 → 全局记忆 → 「memory」页面，表格 + 关系图都能看（见下面「WebUI 管理页」）。
+
 ## 指令
 
 | 指令 | 作用 |
@@ -60,6 +62,48 @@ AstrBot 自带的长期记忆有两个毛病，用久了很明显。
 | `/mem import-lm [--dry-run] [--path]` | **从 LivingMemory 直接搬家** |
 
 另外注册了 `memory_add` / `memory_search` 两个 LLM 工具，模型可以自己决定什么时候记、什么时候查——而不是每轮往 prompt 里塞记忆。
+
+## WebUI 管理页
+
+v0.6.0 起带一个管理页，不用记指令也能看库、改库。
+
+**入口**：AstrBot 控制台 → 插件 → 已安装 → 全局记忆 → 页面标签「memory」。
+地址形如 `/plugin-view/astrbot_plugin_mem/memory`（页面注册在插件的 `views/memory/index.html`，
+每页必须有 `index.html`，见 `astrbot/dashboard/services/plugin_page_service.py:29-30`）。
+
+> 不要用浏览器直接打开 `views/memory/index.html`。页面跑在 dashboard 的 iframe 里，靠
+> 父窗口的 `AstrBotPluginView` 桥发请求（带登录态）；直接打开拿不到凭证，会提示「页面桥未就绪」。
+
+![WebUI 管理页截图](docs/webui.png)
+
+*（截图占位：`docs/webui.png` 待补，四张统计卡 + 表格 + 关系图）*
+
+**能干什么**
+
+| 区域 | 功能 |
+| --- | --- |
+| 顶部 | 搜索框（subject / predicate / value 任一命中，回车或停顿 250ms 生效）、类型下拉、新增按钮 |
+| 统计卡 | 总数 / 有效 / 已作废 / embedding provider 是否可用 |
+| 表格 | id、subject、predicate、value、mtype、importance、更新时间，每行一个「作废」按钮 |
+| 操作区 | 同槽去重、同主语合并；带 `dry-run` 勾选（默认勾上），执行完回显一行结果 |
+| 关系图 | 同一 subject 连成簇；节点大小按 importance、颜色按 mtype、悬停看 value 前 60 字 |
+
+作废是软删：只填 `valid_to`，行还在库里，`/mem stats` 的「历史」会 +1。
+
+**后端接口**（前缀 `/<插件名>/mem-api/`，只有登录后的控制台能调）
+
+| 接口 | 方法 | 说明 |
+| --- | --- | --- |
+| `list?q=&type=&limit=&offset=` | GET | 分页列表，返回 `{total, items[]}` |
+| `stats` | GET | 统计 + provider 状态 |
+| `add` | POST | `{subject, predicate, value, scope?, mtype?, importance?}` |
+| `forget` | POST | `{id}` 按 id 作废（不是按关键词，不会连带） |
+| `dedupe` | POST | `{dry_run}` 同槽去重 |
+| `consolidate` | POST | `{dry_run}` 同主语语义合并 |
+| `graph` | GET | `{nodes[], edges[]}`，最多 300 个节点 |
+
+参数不合法一律 `400` + 中文提示；单条记录字段缺失只影响那一行，不会让整页报错。
+没装老版本核心（没有 `astrbot.api.web`）时插件照常加载，只是没有页面。
 
 ## 从 LivingMemory 搬家
 
@@ -145,13 +189,17 @@ AstrBot 自带的长期记忆有两个毛病，用久了很明显。
 | 检索结果一堆弱相关 | 调高 `min_score`；或确认 embedding provider 挑没挑到 |
 | `记忆库读不了` | `db_path` 指向的文件损坏或无权限，换个路径重试 |
 | 搬家后第一次搜很慢 | 搬家不预先算向量，第一次检索会现算 |
+| 管理页提示「页面桥未就绪」 | 直接用浏览器开了 `index.html`；要从控制台插件页的「memory」标签进 |
+| 管理页接口 404 / 一片空白 | 插件是升级上来的、没重载（路由在 `initialize()` 里注册），在控制台点一次「重载」 |
+| 关系图只画了 300 个点 | 单页上限 300，用搜索或类型下拉缩小范围 |
+| 管理页没有「memory」标签 | 核心太老（没有 `astrbot.api.web` / 插件页面能力），指令功能不受影响 |
 
 ## 开发
 
 实现与验收分开：改动由 tutu 开分支提交 PR，构建和自测由维护者在干净的 `instabox-friend-box` 上跑一遍原始输出才合并。自测全程离线——假 `astrbot.api` 模块桩 + 假 embedder / reranker，不打真实接口。
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 python3 selftest.py --offline   # 当前 308 条断言
+PYTHONDONTWRITEBYTECODE=1 python3 selftest.py --offline   # 当前 435 条断言（v0.5.0 的 308 条 + v0.6.0 新增 127 条）
 ```
 
 
@@ -161,20 +209,22 @@ v0.5.0 起按职责分层，根目录只留入口和元数据：
 
 ```
 astrbot_plugin_mem/
-├── main.py              Star 子类：指令、LLM 工具、注入钩子
+├── main.py              Star 子类：指令、LLM 工具、注入钩子、WebUI 路由注册
 ├── core/
 │   ├── store.py         sqlite 存取、覆盖语义、导入导出
 │   ├── retrieve.py      召回 / RRF 融合 / 重排 / 降级
 │   ├── lifecycle.py     TTL / 衰减 / 访问强化
 │   ├── livingmemory.py  从 LivingMemory 搬家
+│   ├── webapi.py        WebUI 的纯标准库逻辑层（校验 / 分页 / 关系图布局）
 │   └── textnorm.py      归一化与三元组切分
+├── views/memory/index.html  WebUI 管理页（单文件，零构建）
 ├── _conf_schema.json    配置项
 ├── metadata.yaml        插件元数据
 ├── selftest.py          离线自测（假 astrbot 桩）
 └── README.md
 ```
 
-`core/` 里不许 `import astrbot`，业务逻辑保持可脱离框架单测。
+`core/` 里不许 `import astrbot`，业务逻辑保持可脱离框架单测——`core/webapi.py` 同理。
 
 ## License
 

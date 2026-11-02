@@ -46,6 +46,14 @@ v0.8.0 新增（会话归属 origin）：
  33. `/mem sessions [数量]` 聚合、排序、空 origin 归「未记录来源」、参数友好报错
  34. `GET /mem-api/sessions` + `/list?origin=` 精确过滤（可与 q 叠加）
  35. 导入不覆盖已有 origin：`/mem import` / `/mem import-lm` 同槽覆盖沿用旧 origin
+
+v0.8.1 新增（关系图簇星图）：
+ 36. 页面里有簇布局 graphLayout：按 subject 聚簇、取前 16 组、每组最多 4 点、连线 >60px 不画
+ 37. tooltip 是 DOM（#gTip + position:absolute），不是 canvas 画字
+ 38. 滚轮缩放 0.5–3 倍、pointerdown 拖拽、pointerleave 收起、命中 14px
+ 39. 图例四色齐全、画布 470px、注记三段不重叠、去投影、数字衬线
+ 40. node 真跑 graphLayout：40 组 → 16 簇、每簇 ≤ 4 点、半径 ≈ 200、不越界
+ 41. 接口补字段：节点带 subject / predicate，根上带 subjects（不受 300 条截断影响）
 """
 
 from __future__ import annotations
@@ -2023,6 +2031,124 @@ def test_webui_page(chk: Checker) -> None:
     chk.ok("前端：node --check 语法通过", proc.returncode == 0, (proc.stderr or proc.stdout).strip()[:400])
 
 
+# ── v0.8.1：关系图视觉（簇星图 + 交互） ──────────────────────────────
+
+
+def test_graph_visual(main_mod, chk: Checker) -> None:
+    """v0.8.1：关系图从「300 个点撒在同心圆上」改成「按主语聚簇的簇星图」，并加缩放/拖拽/悬停。"""
+    html = open(PAGE_PATH, encoding="utf-8").read()
+    api = main_mod.web_api
+
+    # ① 簇布局
+    chk.ok("v0.8.1：有簇布局函数 graphLayout", "function graphLayout(nodes, w, h)" in html, "")
+    chk.ok("v0.8.1：只取条数最多的 16 组主语", "GRAPH_CLUSTER_MAX = 16" in html, "")
+    chk.ok("v0.8.1：簇心均分在半径 200 的圆周上", "GRAPH_CLUSTER_R = 200" in html, "")
+    chk.ok("v0.8.1：每簇最多 4 个记忆点", "GRAPH_MEMBER_MAX = 4" in html, "")
+    chk.ok("v0.8.1：连线超过 60px 不画", "GRAPH_LINK_MAX = 60" in html, "")
+    chk.ok("v0.8.1：簇心色 #1D4B45", 'GRAPH_HEART = "#1D4B45"' in html, "")
+    chk.ok("v0.8.1：成员点半径 3 + importance*3.4", "3 + imp * 3.4" in html, "")
+    chk.ok("v0.8.1：簇标签主语超过 10 字省略", "length > 10" in html and '…"' in html, "")
+
+    # ② tooltip 走 DOM
+    chk.ok("v0.8.1：tooltip 容器 #gTip 存在", 'id="gTip"' in html and 'class="graph-tip"' in html, "")
+    chk.ok("v0.8.1：tooltip 绝对定位（不是 canvas 画字）",
+           ".graph-tip{" in html and "position:absolute" in html, "")
+
+    # ③ 缩放
+    chk.ok("v0.8.1：滚轮缩放，限在 0.5–3 倍",
+           'addEventListener("wheel"' in html and "Math.min(3, Math.max(0.5" in html, "")
+
+    # ④ 拖拽
+    chk.ok("v0.8.1：按住拖拽平移",
+           'addEventListener("pointerdown"' in html and "setPointerCapture" in html, "")
+    chk.ok("v0.8.1：pointerleave 收起 tooltip", 'addEventListener("pointerleave"' in html, "")
+    chk.ok("v0.8.1：悬停命中半径 14px", "GRAPH_HIT = 14" in html, "")
+
+    # ⑤ 图例：四个类型色 + 右侧操作提示
+    for key, color in (("fact", "#4A6A78"), ("event", "#4E7A5E"),
+                       ("plan", "#8A6A3A"), ("pref", "#6C5F7A")):
+        chk.ok(f"v0.8.1：低饱和类型色 {key} = {color}", color in html, "")
+    chk.ok("v0.8.1：图例四种类型都在",
+           all(t in html for t in ("Fact", "Event", "Plan", "Preference")), "")
+    chk.ok("v0.8.1：图例右侧有操作提示", "滚轮缩放 · 拖拽平移 · 悬停看内容" in html, "")
+
+    # ⑥ 画布高度 / 三段不重叠 / 网格
+    chk.ok("v0.8.1：画布高度 470px", "#graph{height:470px" in html, "")
+    chk.ok("v0.8.1：画布 touch-action:none", "touch-action:none" in html, "")
+    chk.ok("v0.8.1：40px 极淡网格", "rgba(24,24,27,.035)" in html and "x += 40" in html, "")
+    chk.ok("v0.8.1：图例在画布下方、注记在最下（三者不重叠）",
+           html.index('id="graphLegend"') < html.index('id="graphNote"'), "")
+
+    # 注记口径 + 视觉收敛
+    chk.ok("v0.8.1：注记写「N 条记忆归到 M 组主语，另有 K 条折叠」",
+           "条记忆归到" in html and "组主语，另有" in html and "条折叠" in html, "")
+    chk.ok("v0.8.1：去掉卡片投影", "--shadow-1:none" in html, "")
+    chk.ok("v0.8.1：概览数字换衬线 30px",
+           'ui-serif, Georgia, "Songti SC", serif' in html and "font-size:30px" in html, "")
+    chk.ok("v0.8.1：没引入字体文件", "@font-face" not in html, "")
+
+    # 接口：前端聚簇要靠 subject，悬停要靠 predicate
+    graph = api.build_graph([
+        {"id": 1, "subject": "点点", "predicate": "喜欢", "value": "美式",
+         "mtype": "preference", "importance": 0.9},
+        {"id": 2, "subject": "点点", "predicate": "住", "value": "杭州",
+         "mtype": "fact", "importance": 0.5},
+        {"id": 3, "subject": "阿岚", "predicate": "喜欢", "value": "拿铁",
+         "mtype": "preference", "importance": 0.6},
+    ])
+    chk.eq(graph["nodes"][0]["subject"], "点点", "v0.8.1：节点带 subject（聚簇靠它）")
+    chk.eq(graph["nodes"][0]["predicate"], "喜欢", "v0.8.1：节点带 predicate（悬停显示 主语 · 谓词）")
+    chk.eq(graph["subjects"], 2, "v0.8.1：subjects = 不同主语组数")
+
+    many = [{"id": i, "subject": f"s{i % 40}", "predicate": "p", "value": f"v{i}",
+             "mtype": "fact", "importance": (i % 100) / 100.0} for i in range(1, 306)]
+    big = api.build_graph(many)
+    chk.eq(big["subjects"], 40, "v0.8.1：subjects 按全部行算，不被 300 条截断影响")
+
+
+def test_graph_layout_node(chk: Checker) -> None:
+    """把页面里的 graphLayout 抠出来用 node 真跑一遍：簇数 / 成员数 / 半径 / 不越界。"""
+    node = shutil.which("node")
+    if not node:
+        chk.ok("v0.8.1：node 跑布局（未安装 node，跳过）", True, "")
+        return
+    html = open(PAGE_PATH, encoding="utf-8").read()
+    m = _re.search(r"  function graphLayout\(nodes, w, h\) \{.*?\n  \}\n", html, _re.S)
+    chk.ok("v0.8.1：能从页面里抠出 graphLayout", bool(m), "")
+    if not m:
+        return
+    js = (
+        "var GRAPH_CLUSTER_MAX=16,GRAPH_CLUSTER_R=200,GRAPH_MEMBER_MAX=4;\n"
+        + m.group(0)
+        + """
+var nodes=[],id=1;
+for (var g=0;g<40;g++) for (var i=0;i<5;i++)
+  nodes.push({id:id++,subject:"s"+g,predicate:"p"+i,importance:0.5});
+var L=graphLayout(nodes,1100,470);
+console.log(JSON.stringify({groups:L.groups.length,groupCount:L.groupCount,drawn:L.drawn,
+  maxMembers:Math.max.apply(null,L.groups.map(function(x){return x.members.length;})),
+  ring:Math.round(Math.hypot(L.groups[0].x-L.cx,L.groups[0].y-L.cy)),
+  inside:L.groups.every(function(g){return g.x>0&&g.x<1100&&g.y>0&&g.y<470;})}));
+"""
+    )
+    import subprocess
+    import tempfile
+
+    tmp = os.path.join(tempfile.mkdtemp(prefix="mem_layout_"), "layout.js")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(js)
+    proc = subprocess.run([node, tmp], capture_output=True, text=True)
+    chk.ok("v0.8.1：node 跑 graphLayout 不报错", proc.returncode == 0, (proc.stderr or "")[:300])
+    if proc.returncode != 0:
+        return
+    got = json.loads(proc.stdout.strip())
+    chk.eq(got["groups"], 16, "v0.8.1：40 组主语只画前 16 簇")
+    chk.eq(got["maxMembers"], 4, "v0.8.1：每簇最多 4 个记忆点")
+    chk.eq(got["drawn"], 64, "v0.8.1：16 簇 × 4 点 = 64 个点")
+    chk.eq(got["ring"], 199, "v0.8.1：簇心半径约 200（470 高的画布留边后 199）")
+    chk.ok("v0.8.1：所有簇心都落在画布内", got["inside"], got)
+
+
 # ── v0.8.0：会话归属（origin） ─────────────────────────────────────────
 
 
@@ -2315,6 +2441,9 @@ async def run_all() -> int:
         test_webapi_units(main_mod, chk)
         await test_webapi_handlers(main_mod, tmp_root, chk)
         test_webui_page(chk)
+        # v0.8.1：关系图视觉（簇星图 + 交互）
+        test_graph_visual(main_mod, chk)
+        test_graph_layout_node(chk)
         # v0.8.0：会话归属（origin）
         await test_origin_migration(main_mod, tmp_root, chk)
         await test_origin_write_paths(main_mod, tmp_root, chk)

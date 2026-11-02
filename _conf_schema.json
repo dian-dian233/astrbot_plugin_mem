@@ -35,11 +35,41 @@
     "hint": "重排后返回给模型/用户的条数，默认 5。",
     "default": 5
   },
+  "max_value_len": {
+    "description": "单条内容字数上限",
+    "type": "int",
+    "hint": "默认 120（v0.1.0 是硬编码 500）。超长直接拒写，提示改成一句事实。0 = 不限制（不建议）。主语/谓词另限 40 字。",
+    "default": 120
+  },
+  "reject_narrative": {
+    "description": "拒绝叙事体写入",
+    "type": "bool",
+    "hint": "默认 true：value 以「我/他/她/今天/昨天/昨晚/刚才/后来/然后」开头的直接拒写，提示改成一句判断句。日记体记忆检索必脱靶，建议保持开启。",
+    "default": true
+  },
+  "dedupe_threshold": {
+    "description": "写入相似去重阈值",
+    "type": "float",
+    "hint": "默认 0.95。同 scope + 同主语下，新值向量与已有有效记录余弦 ≥ 此值就视为同一件事：旧记录填 valid_to + superseded_by，不新增。0 = 关闭。没配 embedding provider 时自动跳过，不阻塞写入。",
+    "default": 0.95
+  },
+  "min_score": {
+    "description": "检索噪声地板（向量余弦）",
+    "type": "float",
+    "hint": "默认 0.2。关键词一个都没命中、向量相似度又低于此值的候选会被丢掉（v0.1.0 硬编码 0.2）。调高 = 更严格，宁可空手而归。",
+    "default": 0.2
+  },
   "auto_inject_n": {
     "description": "每轮自动注入条数",
     "type": "int",
-    "hint": "0 = 不注入任何记忆（默认，推荐）。N>0 才每轮把 top-N 条塞进 system_prompt，每条截 200 字。会污染闲聊人格并破坏 prompt 缓存。",
+    "hint": "0 = 不注入任何记忆（默认，推荐）。N>0 才每轮把 top-N 条塞进 system_prompt：按主语去重后再截条数，每条截 200 字。会污染闲聊人格并破坏 prompt 缓存。",
     "default": 0
+  },
+  "inject_char_cap": {
+    "description": "注入内容总字数上限",
+    "type": "int",
+    "hint": "默认 600，只在 auto_inject_n > 0 时生效。注入内容总字数超限就按 updated_at 倒序砍（先丢最旧的）。0 = 不限制。",
+    "default": 600
   },
   "allow_all": {
     "description": "允许所有人写记忆",

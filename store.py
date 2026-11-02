@@ -244,8 +244,13 @@ class Store:
         *,
         source: str = "chat",
         confidence: float = 0.8,
+        supersede_ids: list[int] | None = None,
     ) -> dict:
-        """写一条事实。同槽旧记录自动作废（填 valid_to + superseded_by）。"""
+        """写一条事实。同槽旧记录自动作废（填 valid_to + superseded_by）。
+
+        supersede_ids：上层（写入相似去重）判定「同一件事」的其它记录，一并作废。
+        和同槽覆盖走同一条落库路径，保证 superseded_by 都指向本次新 id。
+        """
         ts = now_iso()
         with self._conn() as conn:
             old = conn.execute(
@@ -259,9 +264,17 @@ class Store:
             )
             new_id = int(cur.lastrowid)
             superseded = [int(r["id"]) for r in old]
+            for extra in supersede_ids or []:
+                try:
+                    extra_id = int(extra)
+                except (TypeError, ValueError):
+                    continue
+                if extra_id != new_id and extra_id not in superseded:
+                    superseded.append(extra_id)
             for old_id in superseded:
                 conn.execute(
-                    "UPDATE mem SET valid_to=?, superseded_by=?, updated_at=? WHERE id=?",
+                    "UPDATE mem SET valid_to=?, superseded_by=?, updated_at=? "
+                    "WHERE id=? AND valid_to IS NULL",
                     (ts, new_id, ts, old_id),
                 )
             row = conn.execute("SELECT * FROM mem WHERE id=?", (new_id,)).fetchone()
@@ -312,6 +325,73 @@ class Store:
         with self._conn() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [_row_to_dict(r) for r in rows]
+
+    @_db_guard
+    def active_rows_by_subject(self, scope: str, subject: str) -> list[dict]:
+        """同 scope + 同主语的全部有效记录（写入相似去重的候选池）。"""
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM mem WHERE scope=? AND subject=? AND valid_to IS NULL "
+                "ORDER BY updated_at DESC, id DESC",
+                (scope, subject),
+            ).fetchall()
+        return [_row_to_dict(r) for r in rows]
+
+    @_db_guard
+    def dedupe_slots(self, *, dry_run: bool = False) -> dict:
+        """全库扫同槽重复：`(scope, subject, predicate)` 每组只留 `updated_at` 最新的一条。
+
+        dry_run=True 只统计不改库。返回里的 `mergeable_groups` 就是「可合并 M 组」。
+        """
+        ts = now_iso()
+        with self._conn() as conn:
+            rows = [
+                _row_to_dict(r)
+                for r in conn.execute(
+                    "SELECT * FROM mem WHERE valid_to IS NULL "
+                    "ORDER BY scope, subject, predicate, updated_at, id"
+                ).fetchall()
+            ]
+            groups: dict[tuple[str, str, str], list[dict]] = {}
+            for row in rows:
+                groups.setdefault((row["scope"], row["subject"], row["predicate"]), []).append(row)
+
+            keep: dict[tuple[str, str, str], dict] = {}
+            drop: list[dict] = []
+            merged_groups: dict[str, int] = {}
+            for key, items in groups.items():
+                best = items[0]
+                for cand in items[1:]:
+                    newer = _newer(cand["updated_at"], best["updated_at"])
+                    tie = (
+                        str(cand["updated_at"]) == str(best["updated_at"])
+                        and int(cand["id"]) > int(best["id"])
+                    )
+                    if newer or tie:
+                        best = cand
+                keep[key] = best
+                if len(items) > 1:
+                    merged_groups[f"{key[0]}|{key[1]}|{key[2]}"] = int(best["id"])
+                    drop.extend(r for r in items if int(r["id"]) != int(best["id"]))
+
+            if drop and not dry_run:
+                for row in drop:
+                    slot = (row["scope"], row["subject"], row["predicate"])
+                    conn.execute(
+                        "UPDATE mem SET valid_to=?, superseded_by=?, updated_at=? "
+                        "WHERE id=? AND valid_to IS NULL",
+                        (ts, int(keep[slot]["id"]), ts, int(row["id"])),
+                    )
+
+        return {
+            "scanned": len(rows),
+            "mergeable_groups": len(merged_groups),
+            "mergeable_rows": len(drop),
+            "superseded": [int(r["id"]) for r in drop],
+            "kept": merged_groups,
+            "dry_run": bool(dry_run),
+            "applied": bool(drop) and not dry_run,
+        }
 
     @_db_guard
     def keyword_search(self, terms: list[str], *, limit: int = 30, scope: str | None = None) -> list[dict]:

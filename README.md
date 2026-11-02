@@ -135,6 +135,25 @@ AstrBot 自带的长期记忆有两个毛病，用久了很明显。
 | `access_cap` / `access_halve` | 10 / 0.5 | 访问强化上限与衰减回落 |
 | `allow_all` / `allowed_users` / `allowed_groups` | false / [] / [] | 写权限 |
 
+
+## WebUI
+
+插件详情页里会多一个「记忆管理」页签（`views/memory/index.html`），不用敲指令也能看和改：
+
+- 顶部搜索 + 类型筛选 + 新增按钮，四个统计卡（有效条数 / 事实偏好 / 经历待办 / 高重要度）
+- 列表分页，每行显示 id、主语·谓词、值、类型、权重、更新时间，行内可「作废」
+- 一键 `dedupe`（带 dry-run 勾选），跑完在右下角回显结果
+- 右侧「关系图」：canvas 按主语聚簇画节点，节点大小按 importance，颜色按类型，悬停显示值的前 60 字；超过 300 个节点自动截断并提示
+
+接口都在 `/mem/api/plug/astrbot_plugin_mem/mem/*` 下（`list` / `stats` / `graph` / `add` / `forget` / `dedupe`），
+API 层只做薄封装，写入仍然走插件唯一的 `_write_fact` 通道，降噪与校验规则和指令完全一致。
+
+数据层有独立的离线自测（不依赖 astrbot、不起 HTTP）：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 test_webapi.py   # 14 条断言：分页/搜索/筛选/统计/关系图/错误体
+```
+
 ## 排错
 
 | 现象 | 原因 |

@@ -88,9 +88,11 @@ try:
         ttl_for,
     )
     from .core.livingmemory import LivingMemoryError, format_not_found, format_report, probe, run_import
+    from .core import webapi
     from .core.store import Store, StoreError, astrbot_data_dirs, resolve_db_path
     from .core.textnorm import normalize_text
 except ImportError:  # pragma: no cover - 只在平铺加载时命中
+    from core import webapi
     from core.retrieve import (
         EMBED_TIMEOUT,
         Retriever,
@@ -360,6 +362,88 @@ class MemPlugin(Star):
         self.conf = dict(config or {})
         self._store: Store | None = None
         self._store_path = ""
+        self._web_enabled = False
+
+    # ── WebUI API（插件加载完成后由框架调用 initialize） ──────────
+    async def initialize(self) -> None:
+        """注册 WebUI 用的 /mem-api 接口；老版本没有 astrbot.api.web 就静默跳过。"""
+        try:
+            from astrbot.api.web import request  # noqa: F401
+        except Exception:  # 老版本框架
+            return
+        self._web_enabled = True
+        apis = [
+            ("/mem/list", self._api_list, ["GET"], "记忆列表（筛选 + 分页）"),
+            ("/mem/stats", self._api_stats, ["GET"], "记忆统计与 provider 状态"),
+            ("/mem/graph", self._api_graph, ["GET"], "按主语聚簇的关系图数据"),
+            ("/mem/add", self._api_add, ["POST"], "新增一条记忆"),
+            ("/mem/forget", self._api_forget, ["POST"], "作废一条记忆"),
+            ("/mem/dedupe", self._api_dedupe, ["POST"], "合并同槽重复"),
+        ]
+        for route, handler, methods, desc in apis:
+            self.context.register_web_api(route, handler, methods, desc)
+
+    def _api_rows(self) -> list[dict]:
+        """WebUI 只看有效记录；上限 5000 条，够一个记忆库用。"""
+        return self._get_store().active_rows(scope=self._scope(), limit=5000)
+
+    async def _api_list(self) -> dict:
+        from astrbot.api.web import request
+
+        return webapi.list_payload(
+            self._api_rows(),
+            q=request.query.get("q", ""),
+            mtype=request.query.get("type", ""),
+            limit=request.query.get("limit", 20),
+            offset=request.query.get("offset", 0),
+        )
+
+    async def _api_stats(self) -> dict:
+        embed_id, _ = self._embed_provider()
+        rerank_id, _ = self._rerank_provider()
+        extra = {
+            "scope": self._scope(),
+            "embed": bool(embed_id),
+            "rerank": bool(rerank_id),
+            "embed_provider": embed_id or "",
+            "rerank_provider": rerank_id or "",
+            "db_path": self._store_path,
+        }
+        return webapi.stats_payload(self._api_rows(), extra=extra)
+
+    async def _api_graph(self) -> dict:
+        return webapi.graph_payload(self._api_rows())
+
+    async def _api_add(self) -> dict:
+        from astrbot.api.web import request
+
+        body = await request.json({}) or {}
+        try:
+            row = await self._write_fact(
+                self._scope(),
+                str(body.get("subject", "")),
+                str(body.get("predicate", "")),
+                str(body.get("value", "")),
+                source="webui",
+                mtype=str(body.get("mtype") or self._conf_str("default_mtype", DEFAULT_MTYPE)),
+                importance=body.get("importance"),
+            )
+        except Exception as e:  # 校验失败：回 400 语义的错误体
+            return webapi.error_payload(e)
+        return webapi.ok_payload(message=f"已写入 #{row.get('id')}", id=row.get("id"))
+
+    async def _api_forget(self) -> dict:
+        from astrbot.api.web import request
+
+        body = await request.json({}) or {}
+        mem_id = body.get("id")
+        if mem_id is None:
+            return webapi.error_payload("缺少 id")
+        row = self._get_store().get(int(mem_id))
+        if not row:
+            return webapi.error_payload(f"没有 #{mem_id}")
+        self._get_store().forget(str(row.get("value", ""))[:40], scope=row.get("scope"))
+        return webapi.ok_payload(message=f"已作废 #{mem_id}")
 
     # -- 配置读取（AstrBotConfig 是 dict 子类，但单测里可能给普通 dict） --
     def _conf_str(self, key: str, default: str = "") -> str:

@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>记忆管理 · astrbot_plugin_mem</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#161a21; --line:#242a34; --text:#e6e8ec; --muted:#8b93a1;
+    --accent:#5b9cf8; --fact:#5b9cf8; --pref:#f0a44a; --event:#57c88a; --plan:#d96a8a;
+    --danger:#e0574a;
+  }
+  @media (prefers-color-scheme: light){
+    :root{ --bg:#f6f7f9; --panel:#fff; --line:#e5e7eb; --text:#1f2328; --muted:#6b7280; }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+       font:14px/1.6 -apple-system,"PingFang SC","Microsoft YaHei",system-ui,sans-serif;}
+  .wrap{max-width:1180px;margin:0 auto;padding:20px}
+  header{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:16px}
+  h1{font-size:17px;margin:0;font-weight:600;letter-spacing:.02em}
+  .badge{font-size:12px;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:2px 9px}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:16px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+  .card b{display:block;font-size:22px;font-weight:600;margin-top:2px}
+  .card span{font-size:12px;color:var(--muted)}
+  .bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
+  input,select,button{background:var(--panel);color:var(--text);border:1px solid var(--line);
+    border-radius:8px;padding:7px 10px;font-size:13px;font-family:inherit}
+  input{min-width:220px}
+  button{cursor:pointer}
+  button:hover{border-color:var(--accent)}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  button.danger{color:var(--danger);border-color:var(--danger)}
+  .grid{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(0,1fr);gap:14px;align-items:start}
+  @media (max-width:900px){ .grid{grid-template-columns:1fr} }
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+  .panel h2{font-size:13px;margin:0;padding:10px 14px;border-bottom:1px solid var(--line);color:var(--muted);font-weight:500}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--muted);font-weight:500;font-size:12px;white-space:nowrap}
+  td.val{max-width:360px;word-break:break-word}
+  .tag{display:inline-block;font-size:11px;padding:1px 7px;border-radius:999px;border:1px solid currentColor}
+  .t-fact{color:var(--fact)} .t-preference{color:var(--pref)} .t-event{color:var(--event)} .t-plan{color:var(--plan)}
+  .muted{color:var(--muted)}
+  .empty{padding:24px;text-align:center;color:var(--muted)}
+  canvas{display:block;width:100%;height:340px;background:transparent}
+  #toast{position:fixed;right:18px;bottom:18px;display:flex;flex-direction:column;gap:8px;z-index:9}
+  #toast div{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--accent);
+    border-radius:8px;padding:8px 12px;font-size:13px;box-shadow:0 6px 20px rgba(0,0,0,.25)}
+  #toast div.err{border-left-color:var(--danger)}
+  .pager{display:flex;gap:8px;align-items:center;padding:10px 14px;border-top:1px solid var(--line);font-size:12px;color:var(--muted)}
+  .pager button{padding:4px 9px}
+  dialog{background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:12px;padding:18px;width:min(520px,92vw)}
+  dialog label{display:block;font-size:12px;color:var(--muted);margin:10px 0 4px}
+  dialog input,dialog select,dialog textarea{width:100%}
+  dialog textarea{min-height:80px;resize:vertical;background:var(--panel);color:var(--text);
+    border:1px solid var(--line);border-radius:8px;padding:8px;font-family:inherit;font-size:13px}
+  .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>记忆管理</h1>
+    <span class="badge" id="scopeBadge">scope: global</span>
+    <span class="badge" id="providerBadge">provider: —</span>
+  </header>
+
+  <div class="cards">
+    <div class="card"><span>有效记录</span><b id="statTotal">—</b></div>
+    <div class="card"><span>事实 / 偏好</span><b id="statFact">—</b></div>
+    <div class="card"><span>经历 / 待办</span><b id="statEvent">—</b></div>
+    <div class="card"><span>高重要度(≥0.9)</span><b id="statHigh">—</b></div>
+  </div>
+
+  <div class="bar">
+    <input id="search" placeholder="搜主语 / 谓词 / 值…" />
+    <select id="typeFilter">
+      <option value="all">全部类型</option>
+      <option value="fact">事实</option>
+      <option value="preference">偏好</option>
+      <option value="event">经历</option>
+      <option value="plan">待办</option>
+    </select>
+    <button class="primary" id="btnAdd">新增一条</button>
+    <button id="btnDedupe">合并同主语</button>
+    
+    <label class="muted"><input type="checkbox" id="dryRun" style="min-width:auto" checked /> dry-run</label>
+  </div>
+
+  <div class="grid">
+    <div class="panel">
+      <h2>记忆列表</h2>
+      <table>
+        <thead><tr><th>ID</th><th>主语 / 谓词</th><th>值</th><th>类型</th><th>权重</th><th>更新</th><th></th></tr></thead>
+        <tbody id="table"><tr><td colspan="7" class="empty">加载中…</td></tr></tbody>
+      </table>
+      <div class="pager">
+        <button id="prevPage">上一页</button>
+        <span id="pageInfo">—</span>
+        <button id="nextPage">下一页</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>关系图（按主语聚簇）</h2>
+      <canvas id="graph"></canvas>
+      <div class="pager"><span id="graphInfo">悬停节点看内容</span></div>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<dialog id="addDialog">
+  <h2 style="margin:0;font-size:15px">新增一条记忆</h2>
+  <label>主语</label><input id="fSubject" placeholder="点点" />
+  <label>谓词</label><input id="fPredicate" placeholder="主力开发机" />
+  <label>值（≤120 字，写一句事实）</label><textarea id="fValue" placeholder="freestyle-vm（4 核 7G）"></textarea>
+  <label>类型</label>
+  <select id="fType">
+    <option value="fact">事实</option><option value="preference">偏好</option>
+    <option value="event">经历</option><option value="plan">待办</option>
+  </select>
+  <div class="row">
+    <button id="addCancel">取消</button>
+    <button class="primary" id="addSubmit">写入</button>
+  </div>
+</dialog>
+
+<script>
+const API = "/api/plug/astrbot_plugin_mem";
+var state = { q: "", type: "all", limit: 20, offset: 0, total: 0 };
+
+function toast(msg, isErr) {
+  var el = document.createElement("div");
+  if (isErr) el.className = "err";
+  el.textContent = msg;
+  document.getElementById("toast").appendChild(el);
+  setTimeout(function () { el.remove(); }, 4200);
+}
+
+async function api(path, opts) {
+  var res = await fetch(API + path, Object.assign({ credentials: "include",
+    headers: { "Content-Type": "application/json" } }, opts || {}));
+  var data = null;
+  try { data = await res.json(); } catch (e) { throw new Error("返回内容不是 JSON（HTTP " + res.status + "）"); }
+  if (!res.ok || data.ok === false) throw new Error(data.message || ("HTTP " + res.status));
+  return data;
+}
+
+function typeTag(t) {
+  var label = { fact: "事实", preference: "偏好", event: "经历", plan: "待办" }[t] || t;
+  return '<span class="tag t-' + t + '">' + label + "</span>";
+}
+
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+    return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+  });
+}
+
+async function loadList() {
+  var tbody = document.getElementById("table");
+  try {
+    var qs = "?q=" + encodeURIComponent(state.q) + "&type=" + encodeURIComponent(state.type) +
+      "&limit=" + state.limit + "&offset=" + state.offset;
+    var data = await api("/mem/list" + qs);
+    state.total = data.total;
+    if (!data.items.length) {
+      tbody.innerHTML = '<tr><td colspan="7" class="empty">没有匹配的记录</td></tr>';
+    } else {
+      tbody.innerHTML = data.items.map(function (it) {
+        return '<tr>' +
+          '<td class="muted">' + it.id + '</td>' +
+          '<td>' + esc(it.subject) + '<br><span class="muted">' + esc(it.predicate) + '</span></td>' +
+          '<td class="val">' + esc(it.value) + '</td>' +
+          '<td>' + typeTag(it.mtype) + '</td>' +
+          '<td>' + it.importance + '</td>' +
+          '<td class="muted">' + esc((it.updated_at || "").slice(0, 16).replace("T", " ")) + '</td>' +
+          '<td><button class="danger" data-forget="' + it.id + '">作废</button></td></tr>';
+      }).join("");
+      Array.prototype.forEach.call(tbody.querySelectorAll("[data-forget]"), function (btn) {
+        btn.onclick = function () { forget(btn.getAttribute("data-forget")); };
+      });
+    }
+    var from = data.total ? state.offset + 1 : 0;
+    var to = Math.min(state.offset + state.limit, data.total);
+    document.getElementById("pageInfo").textContent = from + "–" + to + " / " + data.total;
+    document.getElementById("prevPage").disabled = state.offset <= 0;
+    document.getElementById("nextPage").disabled = to >= data.total;
+  } catch (e) {
+    tbody.innerHTML = '<tr><td colspan="7" class="empty">加载失败：' + esc(e.message) + "</td></tr>";
+    toast("列表加载失败：" + e.message, true);
+  }
+}
+
+async function loadStats() {
+  try {
+    var d = await api("/mem/stats");
+    document.getElementById("statTotal").textContent = d.total;
+    var t = d.by_type || {};
+    document.getElementById("statFact").textContent = (t.fact || 0) + " / " + (t.preference || 0);
+    document.getElementById("statEvent").textContent = (t.event || 0) + " / " + (t.plan || 0);
+    document.getElementById("statHigh").textContent = d.high_importance;
+    document.getElementById("scopeBadge").textContent = "scope: " + (d.scope || "global");
+    document.getElementById("providerBadge").textContent =
+      "provider: " + (d.embed ? "向量 ✓" : "向量 ✗") + " · " + (d.rerank ? "重排 ✓" : "重排 ✗");
+  } catch (e) {
+    toast("统计加载失败：" + e.message, true);
+  }
+}
+
+async function forget(id) {
+  try {
+    await api("/mem/forget", { method: "POST", body: JSON.stringify({ id: Number(id) }) });
+    toast("已作废 #" + id);
+    refresh();
+  } catch (e) { toast("作废失败：" + e.message, true); }
+}
+
+async function runMaintenance(kind) {
+  var dry = document.getElementById("dryRun").checked;
+  try {
+    var d = await api("/mem/" + kind, { method: "POST", body: JSON.stringify({ dry_run: dry }) });
+    toast((dry ? "[dry] " : "") + kind + "：" + (d.message || "完成"));
+    if (!dry) refresh();
+  } catch (e) { toast(kind + " 失败：" + e.message, true); }
+}
+
+var graphData = null;
+
+async function loadGraph() {
+  try {
+    var d = await api("/mem/graph");
+    graphData = d;
+    document.getElementById("graphInfo").textContent =
+      d.nodes.length + " 个节点 · " + d.groups + " 组" + (d.truncated ? "（已截断 " + d.truncated + " 个）" : "");
+    drawGraph();
+  } catch (e) { toast("关系图加载失败：" + e.message, true); }
+}
+
+function drawGraph() {
+  var cv = document.getElementById("graph");
+  var dpr = window.devicePixelRatio || 1;
+  var w = cv.clientWidth, h = cv.clientHeight;
+  cv.width = w * dpr; cv.height = h * dpr;
+  var ctx = cv.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  if (!graphData || !graphData.nodes.length) return;
+
+  var hubs = graphData.nodes.filter(function (n) { return n.kind === "subject"; });
+  var cx = w / 2, cy = h / 2;
+  var R = Math.min(w, h) * 0.36;
+  var pos = {};
+  hubs.forEach(function (hub, i) {
+    var a = (i / Math.max(hubs.length, 1)) * Math.PI * 2;
+    pos[hub.id] = { x: cx + Math.cos(a) * R, y: cy + Math.sin(a) * R };
+  });
+  var children = {};
+  graphData.edges.forEach(function (e) {
+    (children[e.source] = children[e.source] || []).push(e.target);
+  });
+  hubs.forEach(function (hub) {
+    var kids = children[hub.id] || [];
+    kids.forEach(function (id, j) {
+      var a = (j / Math.max(kids.length, 1)) * Math.PI * 2;
+      var r = 26 + kids.length * 1.2;
+      pos[id] = { x: pos[hub.id].x + Math.cos(a) * r, y: pos[hub.id].y + Math.sin(a) * r };
+    });
+  });
+
+  var colors = { fact: "#5b9cf8", preference: "#f0a44a", event: "#57c88a", plan: "#d96a8a" };
+  ctx.strokeStyle = "rgba(140,150,170,.35)";
+  ctx.beginPath();
+  graphData.edges.forEach(function (e) {
+    var a = pos[e.source], b = pos[e.target];
+    if (a && b) { ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); }
+  });
+  ctx.stroke();
+
+  graphData.nodes.forEach(function (n) {
+    var p = pos[n.id]; if (!p) return;
+    var isHub = n.kind === "subject";
+    var r = isHub ? 7 : 3 + (n.importance || 0) * 4;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+    ctx.fillStyle = isHub ? "#9aa4b2" : (colors[n.mtype] || "#888");
+    ctx.fill();
+    if (isHub) {
+      ctx.fillStyle = getComputedStyle(document.body).color;
+      ctx.font = "11px system-ui";
+      ctx.textAlign = "center";
+      ctx.fillText(n.label.slice(0, 8), p.x, p.y - 10);
+    }
+  });
+
+  cv.onmousemove = function (ev) {
+    var rect = cv.getBoundingClientRect();
+    var mx = ev.clientX - rect.left, my = ev.clientY - rect.top;
+    var best = null, bestD = 12;
+    graphData.nodes.forEach(function (n) {
+      var p = pos[n.id]; if (!p) return;
+      var d = Math.hypot(p.x - mx, p.y - my);
+      if (d < bestD) { bestD = d; best = n; }
+    });
+    document.getElementById("graphInfo").textContent = best
+      ? best.label + "：" + (best.value || "").slice(0, 60)
+      : graphData.nodes.length + " 个节点 · " + graphData.groups + " 组";
+  };
+}
+
+function refresh() { loadList(); loadStats(); loadGraph(); }
+
+var searchTimer = null;
+document.getElementById("search").oninput = function (e) {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(function () {
+    state.q = e.target.value.trim(); state.offset = 0; loadList();
+  }, 260);
+};
+document.getElementById("typeFilter").onchange = function (e) {
+  state.type = e.target.value; state.offset = 0; loadList();
+};
+document.getElementById("prevPage").onclick = function () {
+  state.offset = Math.max(0, state.offset - state.limit); loadList();
+};
+document.getElementById("nextPage").onclick = function () {
+  state.offset += state.limit; loadList();
+};
+document.getElementById("btnDedupe").onclick = function () { runMaintenance("dedupe"); };
+
+var dlg = document.getElementById("addDialog");
+document.getElementById("btnAdd").onclick = function () { dlg.showModal(); };
+document.getElementById("addCancel").onclick = function () { dlg.close(); };
+document.getElementById("addSubmit").onclick = async function () {
+  var payload = {
+    subject: document.getElementById("fSubject").value.trim(),
+    predicate: document.getElementById("fPredicate").value.trim(),
+    value: document.getElementById("fValue").value.trim(),
+    mtype: document.getElementById("fType").value
+  };
+  try {
+    var d = await api("/mem/add", { method: "POST", body: JSON.stringify(payload) });
+    toast(d.message || "已写入");
+    dlg.close();
+    refresh();
+  } catch (e) { toast("写入失败：" + e.message, true); }
+};
+window.addEventListener("resize", drawGraph);
+
+refresh();
+</script>
+</body>
+</html>

@@ -1967,10 +1967,10 @@ def test_webui_page(chk: Checker) -> None:
     ):
         chk.ok(f"前端：#{element_id}（{label}）存在", f'id="{element_id}"' in html, "")
     chk.ok("前端：浅色主题 Token", "#F8F9FA" in html and "#FFFFFF" in html and "#18181B" in html, "")
-    chk.ok("前端：跟随系统主题（prefers-color-scheme）", "prefers-color-scheme" in html, "")
+    chk.ok("前端：统一圆角 Token", "--r-md" in html and "--r-lg" in html, "")
     chk.ok("前端：用 fetch 调 mem-api", "mem-api" in html and "fetch(" in html, "")
     chk.ok("前端：调用列表与统计接口", '"/list"' in html and '"/stats"' in html, "")
-    chk.ok("前端：维护操作带 dry_run", "dry_run" in html and '"/dedupe"' in html, "")
+    chk.ok("前端：维护操作带 dry_run", "dry_run" in html and 'maintenance("dedupe")' in html, "")
     chk.ok("前端：关系图用 canvas", "<canvas" in html and 'getContext("2d")' in html, "")
     chk.ok("前端：节点大小按 importance", "importance" in html, "")
     chk.ok("前端：悬停提示截 60 字", "slice(0, 60)" in html, "")

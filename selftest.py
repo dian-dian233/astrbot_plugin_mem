@@ -44,6 +44,7 @@ v0.4.0 新增（从 LivingMemory 搬家 /mem import-lm）：
 from __future__ import annotations
 
 import argparse
+import re as _re
 import asyncio
 import json
 import os

@@ -61,7 +61,7 @@ def parse_int(raw: Any, *, default: int, low: int, high: int, label: str) -> int
 
 
 def parse_list_query(query: Mapping[str, Any] | None) -> dict:
-    """`GET list?q=&type=&limit=&offset=` → 已校验的参数字典。"""
+    """`GET list?q=&type=&origin=&limit=&offset=` → 已校验的参数字典。"""
     query = query or {}
     q = _text(query.get("q"))
     if len(q) > 200:
@@ -71,9 +71,15 @@ def parse_list_query(query: Mapping[str, Any] | None) -> dict:
         raise WebApiError(
             f"type 只能是 {' / '.join(MEM_TYPES)}，收到「{mtype}」"
         )
+    # 空 = 全部会话；非空 = 精确匹配 unified_msg_origin（不做模糊匹配，
+    # 否则 `…:123` 会连带 `…:1234`，筛出来的数对不上）
+    origin = _text(query.get("origin"))
+    if len(origin) > 200:
+        raise WebApiError(f"origin 太长了（上限 200 字），收到 {len(origin)} 字")
     return {
         "q": q,
         "type": mtype,
+        "origin": origin,
         "limit": parse_int(
             query.get("limit"), default=DEFAULT_LIMIT, low=1, high=MAX_LIMIT, label="limit"
         ),
@@ -179,6 +185,7 @@ def shape_item(row: Mapping[str, Any]) -> dict:
         "importance": round(_as_float(row.get("importance")), 3),
         "scope": str(row.get("scope") or ""),
         "source": str(row.get("source") or ""),
+        "origin": str(row.get("origin") or ""),
         "updated_at": str(row.get("updated_at") or ""),
         "created_at": str(row.get("created_at") or ""),
         "valid_to": str(row.get("valid_to") or ""),
@@ -186,9 +193,11 @@ def shape_item(row: Mapping[str, Any]) -> dict:
     }
 
 
-def matches(row: Mapping[str, Any], q: str, mtype: str) -> bool:
-    """搜索词命中 subject / predicate / value 任一；mtype 精确匹配。"""
+def matches(row: Mapping[str, Any], q: str, mtype: str, origin: str = "") -> bool:
+    """搜索词命中 subject / predicate / value 任一；mtype / origin 精确匹配。"""
     if mtype and str(row.get("mtype") or "") != mtype:
+        return False
+    if origin and str(row.get("origin") or "") != origin:
         return False
     if not q:
         return True
@@ -199,8 +208,8 @@ def matches(row: Mapping[str, Any], q: str, mtype: str) -> bool:
     return False
 
 
-def filter_rows(rows: Iterable[Mapping[str, Any]], q: str, mtype: str) -> list[dict]:
-    return [dict(row) for row in rows if matches(row, q, mtype)]
+def filter_rows(rows: Iterable[Mapping[str, Any]], q: str, mtype: str, origin: str = "") -> list[dict]:
+    return [dict(row) for row in rows if matches(row, q, mtype, origin)]
 
 
 def paginate(rows: list[dict], limit: int, offset: int) -> tuple[list[dict], int]:
@@ -212,7 +221,7 @@ def paginate(rows: list[dict], limit: int, offset: int) -> tuple[list[dict], int
 def build_list(rows: Iterable[Mapping[str, Any]], query: Mapping[str, Any] | None) -> dict:
     """`GET list` 的完整实现：校验 → 过滤 → 分页 → 整形。"""
     params = parse_list_query(query)
-    matched = filter_rows(rows, params["q"], params["type"])
+    matched = filter_rows(rows, params["q"], params["type"], params["origin"])
     page, total = paginate(matched, params["limit"], params["offset"])
     return {
         "total": total,
@@ -221,6 +230,42 @@ def build_list(rows: Iterable[Mapping[str, Any]], query: Mapping[str, Any] | Non
         "offset": params["offset"],
         "q": params["q"],
         "type": params["type"],
+        "origin": params["origin"],
+    }
+
+
+# ── 会话归属 ──────────────────────────────────────────────────────────
+
+#: 空 origin 在界面 / 指令里的统一叫法
+UNKNOWN_ORIGIN_LABEL = "未记录来源"
+
+
+def build_sessions(counts: Iterable[Mapping[str, Any]] | None) -> dict:
+    """`store.origin_counts()` → 会话下拉 / `/mem sessions` 要的结构。
+
+    `items` 按条数降序；空 origin 合成一组，`label` 给「未记录来源」。
+    `count` 是会话组数，`total` 是这些组里的有效记忆条数（两者不一样，别混）。
+    """
+    items: list[dict] = []
+    for raw in counts or []:
+        origin = _text(raw.get("origin"))
+        try:
+            count = int(raw.get("count") or 0)
+        except (TypeError, ValueError):
+            count = 0
+        items.append(
+            {
+                "origin": origin,
+                "label": origin or UNKNOWN_ORIGIN_LABEL,
+                "count": count,
+                "last_updated": str(raw.get("last_updated") or ""),
+            }
+        )
+    items.sort(key=lambda item: (-item["count"], item["origin"]))
+    return {
+        "items": items,
+        "count": len(items),
+        "total": sum(item["count"] for item in items),
     }
 
 
@@ -373,6 +418,7 @@ __all__ = [
     "MAX_LIMIT",
     "MEM_TYPES",
     "WebApiError",
+    "UNKNOWN_ORIGIN_LABEL",
     "parse_int",
     "parse_list_query",
     "parse_bool",
@@ -383,6 +429,7 @@ __all__ = [
     "filter_rows",
     "paginate",
     "build_list",
+    "build_sessions",
     "build_stats",
     "build_graph",
     "summarize_dedupe",

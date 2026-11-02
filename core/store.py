@@ -6,9 +6,14 @@
 
     mem(id, scope, subject, predicate, value, confidence, source,
         created_at, updated_at, valid_from, valid_to, superseded_by,
-        mtype, importance, ttl_days, decay_type, last_accessed_at, access_count)
+        mtype, importance, ttl_days, decay_type, last_accessed_at, access_count,
+        origin)
     vec(mem_id, model, dim, vec BLOB, text_hash)
     meta(key, value)          -- 衰减回合上次执行时间等
+
+`origin`（v0.8.0）存 `unified_msg_origin`，形如 `diandian:GroupMessage:738458661`，
+用来回答「这条记忆是哪个会话写的」。没有来源时是空串（不能是 NULL：老库 ALTER 时
+`NOT NULL DEFAULT ''` 才会给已有行填默认值）。
 
 v0.3.0 的六个生命周期列**全部有默认值**，老库启动时由 `_ensure_columns()` 逐列
 `ALTER TABLE ... ADD COLUMN` 补上：v0.2 及更早的数据会拿到 mtype=fact、
@@ -50,6 +55,9 @@ from .lifecycle import (
 )
 
 DEFAULT_DB_NAME = "mem.db"
+# 会话来源（unified_msg_origin）最长保留多少字符：umo 一般是 `平台:消息类型:会话号`，
+# 200 足够；给个上限是防止脏数据把 db 撑大 / 前端下拉框被一条超长值拖坏。
+MAX_ORIGIN_LEN = 200
 # 本文件在 <插件根>/core/ 下，往上退一层才是插件目录；
 # 这个值用于「db_path 不许落在插件代码目录」的拦截和 data 目录反推，退错一层会静默失效。
 PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -73,7 +81,8 @@ CREATE TABLE IF NOT EXISTS mem(
   ttl_days REAL NOT NULL DEFAULT 3650,
   decay_type TEXT NOT NULL DEFAULT 'exp',
   last_accessed_at TEXT,
-  access_count INTEGER NOT NULL DEFAULT 0
+  access_count INTEGER NOT NULL DEFAULT 0,
+  origin TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS ix_mem_slot ON mem(scope, subject, predicate, valid_to);
 CREATE INDEX IF NOT EXISTS ix_mem_subject ON mem(subject);
@@ -93,7 +102,7 @@ CREATE TABLE IF NOT EXISTS meta(
 );
 """
 
-# v0.3.0 生命周期列：老库缺哪列补哪列（ALTER TABLE 带 DEFAULT，已有行自动填默认值）
+# v0.3.0 生命周期列 + v0.8.0 会话来源列：老库缺哪列补哪列（ALTER TABLE 带 DEFAULT，已有行自动填默认值）
 SCHEMA_COLUMNS = {
     "mtype": "TEXT NOT NULL DEFAULT 'fact'",
     "importance": "REAL NOT NULL DEFAULT 0.5",
@@ -101,11 +110,15 @@ SCHEMA_COLUMNS = {
     "decay_type": "TEXT NOT NULL DEFAULT 'exp'",
     "last_accessed_at": "TEXT",
     "access_count": "INTEGER NOT NULL DEFAULT 0",
+    "origin": "TEXT NOT NULL DEFAULT ''",
 }
 
 
 def _ensure_columns(conn) -> list[str]:
-    """给老库补生命周期列，返回本次新增的列名（新库返回空列表）。"""
+    """给老库补列，返回本次新增的列名（新库返回空列表）。
+
+    `PRAGMA table_info` 每次现查，不记版本号：跑几次都幂等，缺哪列补哪列。
+    """
     have = {row["name"] for row in conn.execute("PRAGMA table_info(mem)")}
     added: list[str] = []
     for name, ddl in SCHEMA_COLUMNS.items():
@@ -126,6 +139,17 @@ def now_iso(when: datetime | None = None) -> str:
     """
     moment = when or datetime.now(timezone.utc).astimezone()
     return moment.isoformat(timespec="seconds")
+
+
+def normalize_origin(value) -> str:
+    """统一 `unified_msg_origin`：去首尾空白、截到 `MAX_ORIGIN_LEN`。
+
+    None / 数字 / 任意对象都安全转成字符串；拿不到来源时就是空串，**不伪造**
+    （WebUI 写入没有 event，origin 必须是空的）。
+    """
+    if value is None:
+        return ""
+    return str(value).strip()[:MAX_ORIGIN_LEN]
 
 
 # ── 路径解析 ───────────────────────────────────────────────────────────
@@ -322,7 +346,7 @@ class Store:
             _warn(
                 warn,
                 f"[mem] 老库迁移：mem 表补上 {', '.join(self.migrated_columns)} "
-                "（默认 mtype=fact / ttl=3650 天，历史数据不会过期）",
+                "（缺省值：mtype=fact / ttl=3650 天 / origin 空，历史数据不会过期）",
             )
 
     @contextlib.contextmanager
@@ -353,6 +377,7 @@ class Store:
         ttl_days: float | None = None,
         decay_type: str | None = None,
         created_at: str | None = None,
+        origin: str = "",
     ) -> dict:
         """写一条事实。同槽旧记录自动作废（填 valid_to + superseded_by）。
 
@@ -361,8 +386,11 @@ class Store:
 
         mtype / importance / ttl_days / decay_type 留空就按类型默认值补：
         plan 2 天 step、event 30 天 exp、preference 365 天 exp、fact 3650 天 exp。
+
+        origin：写入方会话的 `unified_msg_origin`；WebUI / 导入没有 event，留空。
         """
         name = normalize_mtype(mtype)
+        origin_value = normalize_origin(origin)
         try:
             importance_value = clamp(
                 DEFAULT_IMPORTANCE if importance is None else importance
@@ -384,12 +412,12 @@ class Store:
                 (scope, subject, predicate),
             ).fetchall()
             cur = conn.execute(
-                "INSERT INTO mem(scope,subject,predicate,value,confidence,source,"
+                "INSERT INTO mem(scope,origin,subject,predicate,value,confidence,source,"
                 "created_at,updated_at,valid_from,mtype,importance,ttl_days,decay_type,"
                 "last_accessed_at,access_count) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
                 (
-                    scope, subject, predicate, value, confidence, source,
+                    scope, origin_value, subject, predicate, value, confidence, source,
                     ts, ts, ts, name, importance_value, ttl, decay, ts,
                 ),
             )
@@ -594,6 +622,27 @@ class Store:
                 "SELECT mtype, COUNT(*) n FROM mem WHERE valid_to IS NULL GROUP BY mtype"
             ).fetchall()
         return {str(r["mtype"] or "fact"): int(r["n"]) for r in rows}
+
+    @_db_guard
+    def origin_counts(self) -> list[dict]:
+        """有效记忆按 origin 聚合：会话 ID → 条数 → 最近更新时间。
+
+        按条数降序；空 origin 也会成一组（origin="" ），由调用方显示成「未记录来源」。
+        `last_updated` 只在这一组里取（不是全库），前端下拉和 `/mem sessions` 共用。
+        """
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT origin, COUNT(*) n, MAX(updated_at) last_updated FROM mem "
+                "WHERE valid_to IS NULL GROUP BY origin ORDER BY n DESC, last_updated DESC"
+            ).fetchall()
+        return [
+            {
+                "origin": normalize_origin(r["origin"]),
+                "count": int(r["n"]),
+                "last_updated": str(r["last_updated"] or ""),
+            }
+            for r in rows
+        ]
 
     @_db_guard
     def meta_get(self, key: str, default: str = "") -> str:
@@ -865,6 +914,9 @@ class Store:
             access_count = 0
         return {
             "scope": scope,
+            # v0.8.0：导入不认文件里的 origin —— `/mem import` 没有会话上下文，
+            # 不能把别人的来源硬塞进来；真覆盖时由 `_merge_one` 继承旧行的 origin。
+            "origin": "",
             "subject": subject,
             "predicate": predicate,
             "value": value,
@@ -885,19 +937,22 @@ class Store:
     @_db_guard
     def _merge_one(self, rec: dict) -> str:
         columns = (
-            "scope", "subject", "predicate", "value", "confidence", "source",
+            "scope", "origin", "subject", "predicate", "value", "confidence", "source",
             "created_at", "updated_at", "valid_from", "mtype", "importance",
             "ttl_days", "decay_type", "last_accessed_at", "access_count",
         )
         base_values = [rec[name] for name in columns]
 
-        def insert(conn, valid_to=None, superseded_by=None) -> int:
+        def insert(conn, valid_to=None, superseded_by=None, origin=None) -> int:
+            values = list(base_values)
+            if origin is not None:
+                values[columns.index("origin")] = normalize_origin(origin)
             all_columns = list(columns) + ["valid_to", "superseded_by"]
             cols = ",".join(all_columns)
             marks = ",".join("?" * len(all_columns))
             cur = conn.execute(
                 f"INSERT INTO mem({cols}) VALUES({marks})",
-                [*base_values, valid_to, superseded_by],
+                [*values, valid_to, superseded_by],
             )
             return int(cur.lastrowid)
 
@@ -920,7 +975,9 @@ class Store:
             if not _newer(rec["updated_at"], old["updated_at"]):
                 return "skipped"
 
-            new_id = insert(conn)
+            # 同槽覆盖：新值沿用旧行的 origin。导入本身没有会话上下文（rec["origin"]
+            # 恒为 ""），不能把已有归属抹掉；旧行作废后仍保留它自己的 origin 供审计。
+            new_id = insert(conn, origin=rec.get("origin") or old.get("origin") or "")
             conn.execute(
                 "UPDATE mem SET valid_to=?, superseded_by=?, updated_at=? WHERE id=?",
                 (rec["updated_at"], new_id, rec["updated_at"], old["id"]),
@@ -951,7 +1008,7 @@ class Store:
         added = updated = duplicate = stale = invalid = 0
         outcomes: list[str] = []
         columns = (
-            "scope", "subject", "predicate", "value", "confidence", "source",
+            "scope", "origin", "subject", "predicate", "value", "confidence", "source",
             "created_at", "updated_at", "valid_from", "mtype", "importance",
             "ttl_days", "decay_type", "last_accessed_at", "access_count",
         )
@@ -960,7 +1017,7 @@ class Store:
                 state = {}
             if not state.get("loaded"):
                 rows = conn.execute(
-                    "SELECT id, scope, subject, predicate, value, updated_at "
+                    "SELECT id, scope, subject, predicate, value, updated_at, origin "
                     "FROM mem WHERE valid_to IS NULL"
                 ).fetchall()
                 state["contents"] = {
@@ -968,7 +1025,9 @@ class Store:
                 }
                 state["slots"] = {
                     (r["scope"], r["subject"], r["predicate"]): {
-                        "id": int(r["id"]), "updated_at": r["updated_at"] or "",
+                        "id": int(r["id"]),
+                        "updated_at": r["updated_at"] or "",
+                        "origin": normalize_origin(r["origin"]),
                     }
                     for r in rows
                 }
@@ -993,10 +1052,17 @@ class Store:
                     stale += 1
                     outcomes.append("stale")
                     continue
+                values = []
+                for name in columns:
+                    if name == "origin":
+                        # 同槽覆盖沿用旧行 origin；全新行没有来源（空串）
+                        values.append((old or {}).get("origin") or rec["origin"])
+                    else:
+                        values.append(rec[name])
                 cur = conn.execute(
                     f"INSERT INTO mem({','.join(columns)}) "
                     f"VALUES({','.join('?' * len(columns))})",
-                    [rec[name] for name in columns],
+                    values,
                 )
                 new_id = int(cur.lastrowid)
                 if old is not None:
@@ -1011,7 +1077,11 @@ class Store:
                     added += 1
                     outcomes.append("added")
                 contents.add(key)
-                slots[slot] = {"id": new_id, "updated_at": rec["updated_at"]}
+                slots[slot] = {
+                    "id": new_id,
+                    "updated_at": rec["updated_at"],
+                    "origin": ((old or {}).get("origin") or rec["origin"]),
+                }
             if dry_run:
                 conn.rollback()
         return {

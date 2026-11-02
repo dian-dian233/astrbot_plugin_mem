@@ -5,6 +5,7 @@
     /mem add <主语> <谓词> <内容> [--scope group:123] [--type plan] [--importance 0.9]
     /mem search <关键词> [数量]
     /mem list [数量]
+    /mem sessions [数量]                                   按会话聚合（v0.8.0）
     /mem forget <关键词>
     /mem stats
     /mem dedupe [--dry-run]
@@ -15,7 +16,7 @@
 
 LLM 工具：memory_add / memory_search（`@filter.llm_tool`）。
 
-WebUI（v0.6.0）：`views/memory/index.html` 管理页 + `/<插件名>/mem-api/*` 七个接口，
+WebUI（v0.6.0）：`views/memory/index.html` 管理页 + `/<插件名>/mem-api/*` 接口，
 路由在 `initialize()` 里注册。参数校验与关系图布局在 `core/webapi.py`（纯标准库）。
 
 写入降噪（v0.2.0，规范见 dd-home/memory-policy.md）：一句判断句、≤`max_value_len`（默认
@@ -159,6 +160,7 @@ HELP = """长期记忆（所有会话共享同一份）
 /mem add <主语> <谓词> <内容>   写事实（同槽 / 同义自动覆盖；--type 指定类型）
 /mem search <关键词> [数量]     检索（向量 + 关键词 + 重排）
 /mem list [数量]                最近记录
+/mem sessions [数量]            按会话聚合：会话 ID → 条数 → 最近更新
 /mem forget <关键词>            作废（保留历史，不物理删）
 /mem stats                      条数 / provider 状态 / 最近更新
 /mem dedupe [--dry-run]         扫同槽重复，只留最新（--dry-run 只报告不改库）
@@ -173,6 +175,7 @@ USAGE = {
     "add": "/mem add <主语> <谓词> <内容> [--scope group:123] [--type fact|preference|event|plan]",
     "search": "/mem search <关键词> [数量]",
     "list": "/mem list [数量]",
+    "sessions": "/mem sessions [数量]",
     "forget": "/mem forget <关键词>",
     "dedupe": "/mem dedupe [--dry-run]",
     "consolidate": "/mem consolidate [--dry-run]",
@@ -625,6 +628,11 @@ class MemPlugin(Star):
             max_name=MAX_NAME,
         )
 
+    @staticmethod
+    def _origin_of(event) -> str:
+        """当前事件的 `unified_msg_origin`；老核心 / 桩事件没有就返回空串。"""
+        return str(getattr(event, "unified_msg_origin", "") or "").strip()
+
     async def _write_fact(
         self,
         scope: str,
@@ -635,11 +643,14 @@ class MemPlugin(Star):
         source: str,
         mtype: str = DEFAULT_MTYPE,
         importance: float | None = None,
+        origin: str = "",
     ) -> dict:
         """唯一写入通道：指令和 LLM 工具都走这里，保证降噪规则一致。
 
         mtype 决定 TTL 与衰减方式：plan 2 天 step（过期不参与检索）、event 30 天 exp、
         preference 365 天 exp、fact 3650 天 exp。
+
+        origin 是写入方会话的 `unified_msg_origin`；WebUI / 导入没有 event，传空串。
         """
         store = self._get_store()
         mtype = normalize_mtype(mtype)
@@ -654,6 +665,7 @@ class MemPlugin(Star):
             mtype=mtype,
             importance=importance,
             ttl_days=self._ttl_for(mtype),
+            origin=origin,
         )
         # 新值向量回填缓存：不填的话下次写同主语要把它再算一遍，
         # N 次写入会退化成 O(N²) 次 embedding 调用。
@@ -777,6 +789,8 @@ class MemPlugin(Star):
             return await self._cmd_search(rest, event)
         if action in ("list", "ls", "列表"):
             return self._cmd_list(rest)
+        if action in ("sessions", "会话", "来源"):
+            return self._cmd_sessions(rest)
         if action in ("forget", "del", "delete", "忘记", "作废"):
             return self._cmd_forget(rest, event)
         if action in ("stats", "状态", "统计"):
@@ -794,7 +808,7 @@ class MemPlugin(Star):
         if action in ("help", "?", "帮助"):
             return HELP
         raise ArgError(
-            f"不认识的子指令「{action}」，可用：add / search / list / forget / stats / "
+            f"不认识的子指令「{action}」，可用：add / search / list / sessions / forget / stats / "
             "dedupe / consolidate / export / import / import-lm。"
         )
 
@@ -823,7 +837,8 @@ class MemPlugin(Star):
 
         target = scope or self._scope()
         result = await self._write_fact(
-            target, subject, predicate, value, source="cmd", mtype=mtype, importance=importance
+            target, subject, predicate, value, source="cmd", mtype=mtype, importance=importance,
+            origin=self._origin_of(event),
         )
         line = (
             f"已记住 #{result['id']} [{target}] [{mtype}] "
@@ -863,6 +878,25 @@ class MemPlugin(Star):
             return "记忆库还是空的。用 /mem add <主语> <谓词> <内容> 记第一条。"
         body = "\n".join(format_row(r) for r in fresh[:limit])
         return f"最近 {len(fresh[:limit])} 条（共 {total} 条有效）：\n{body}"
+
+    def _cmd_sessions(self, rest: str) -> str:
+        """按 origin 聚合：会话 ID → 条数 → 最近更新时间（空 origin 归「未记录来源」）。"""
+        limit = parse_limit(rest, 10)
+        rows = self._get_store().origin_counts()
+        if not rows:
+            return "记忆库还是空的。用 /mem add <主语> <谓词> <内容> 记第一条。"
+        total = sum(int(r["count"]) for r in rows)
+        shown = rows[:limit]
+        head = f"记忆来源：{len(rows)} 个会话，共 {total} 条有效记忆"
+        if len(rows) > len(shown):
+            head += f"（显示前 {len(shown)} 个）"
+        lines = []
+        for idx, row in enumerate(shown, 1):
+            name = row["origin"] or web_api.UNKNOWN_ORIGIN_LABEL
+            lines.append(
+                f"{idx}. {name} · {int(row['count'])} 条 · 最近 {short_ts(row['last_updated'])}"
+            )
+        return head + "\n" + "\n".join(lines)
 
     def _cmd_forget(self, rest: str, event) -> str:
         ok, why = self._allow(event, write=True)
@@ -1165,7 +1199,8 @@ class MemPlugin(Star):
             )
         try:
             result = await self._write_fact(
-                self._scope(), subject, predicate, value, source="llm", mtype=resolved
+                self._scope(), subject, predicate, value, source="llm", mtype=resolved,
+                origin=self._origin_of(event),
             )
         except StoreError as e:
             logger.warning(f"[mem] 工具写入失败：{e}")
@@ -1276,7 +1311,8 @@ class MemPlugin(Star):
             logger.info("[mem] 当前核心不支持插件 Web 页面 API，跳过 WebUI 注册")
             return
         routes = [
-            ("list", self._web_list, ["GET"], "记忆列表（分页 + 搜索 + 类型过滤）"),
+            ("list", self._web_list, ["GET"], "记忆列表（分页 + 搜索 + 类型 / 会话过滤）"),
+            ("sessions", self._web_sessions, ["GET"], "会话来源聚合（WebUI 会话下拉）"),
             ("stats", self._web_stats, ["GET"], "记忆库统计 + provider 状态"),
             ("add", self._web_add, ["POST"], "新增一条事实"),
             ("forget", self._web_forget, ["POST"], "按 id 作废一条记忆"),
@@ -1324,6 +1360,11 @@ class MemPlugin(Star):
     async def _web_list(self):
         rows = self._get_store().active_rows()
         return self._web_ok(web_api.build_list(rows, web_request.query))
+
+    @_web_guard
+    async def _web_sessions(self):
+        """会话下拉的数据源：`{items:[{origin,label,count,last_updated}], count, total}`。"""
+        return self._web_ok(web_api.build_sessions(self._get_store().origin_counts()))
 
     @_web_guard
     async def _web_stats(self):

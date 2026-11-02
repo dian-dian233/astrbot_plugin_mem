@@ -54,6 +54,7 @@ AstrBot 自带的长期记忆有两个毛病，用久了很明显。
 | `/mem add <主语> <谓词> <值>` | 写一条事实（自动归一化、去噪、查重） |
 | `/mem search <关键词> [数量]` | 召回 + 融合 + 重排 |
 | `/mem list [数量]` | 最近的有效记录 |
+| `/mem sessions [数量]` | 按会话聚合：会话 ID · 条数 · 最近更新 |
 | `/mem forget <关键词>` | 作废（填 `valid_to`，不物理删） |
 | `/mem stats` | 条数 / provider 状态 / 迁移情况 |
 | `/mem dedupe [--dry-run]` | 合并同主语下的重复 |
@@ -82,7 +83,7 @@ v0.6.0 起带一个管理页，不用记指令也能看库、改库。
 
 | 区域 | 功能 |
 | --- | --- |
-| 顶部 | 搜索框（subject / predicate / value 任一命中，回车或停顿 250ms 生效）、类型下拉、新增按钮 |
+| 顶部 | 搜索框（subject / predicate / value 任一命中，回车或停顿 250ms 生效）、类型下拉、**会话下拉**、新增按钮 |
 | 统计卡 | 总数 / 有效 / 已作废 / embedding provider 是否可用 |
 | 表格 | id、subject、predicate、value、mtype、importance、更新时间，每行一个「作废」按钮 |
 | 操作区 | 同槽去重、同主语合并；带 `dry-run` 勾选（默认勾上），执行完回显一行结果 |
@@ -94,7 +95,8 @@ v0.6.0 起带一个管理页，不用记指令也能看库、改库。
 
 | 接口 | 方法 | 说明 |
 | --- | --- | --- |
-| `list?q=&type=&limit=&offset=` | GET | 分页列表，返回 `{total, items[]}` |
+| `list?q=&type=&origin=&limit=&offset=` | GET | 分页列表，返回 `{total, items[]}`；`origin` 空 = 全部会话 |
+| `sessions` | GET | `{items:[{origin,label,count,last_updated}], count, total}`，会话下拉的数据源 |
 | `stats` | GET | 统计 + provider 状态 |
 | `add` | POST | `{subject, predicate, value, scope?, mtype?, importance?}` |
 | `forget` | POST | `{id}` 按 id 作废（不是按关键词，不会连带） |
@@ -104,6 +106,39 @@ v0.6.0 起带一个管理页，不用记指令也能看库、改库。
 
 参数不合法一律 `400` + 中文提示；单条记录字段缺失只影响那一行，不会让整页报错。
 没装老版本核心（没有 `astrbot.api.web`）时插件照常加载，只是没有页面。
+
+## 会话归属（v0.8.0）
+
+每条记忆多记一个 `origin`：写入它的会话 `unified_msg_origin`，形如
+`diandian:GroupMessage:738458661`。这样能回答「这条记忆是哪个群说的」，也能看出某个群关心什么。
+
+| 写入通道 | origin |
+| --- | --- |
+| `/mem add` | 当前事件的 umo |
+| LLM 工具 `memory_add` | 当前事件的 umo |
+| WebUI「新增记忆」 | 空（没有 event，不伪造） |
+| `/mem import` / `/mem import-lm` | 空；同槽覆盖时沿用旧记录的 origin，不抹掉已有归属 |
+
+看：
+
+```
+/mem sessions          # 会话 ID · 条数 · 最近更新
+/mem sessions 20       # 只看前 20 个
+```
+
+```
+记忆来源：3 个会话，共 12 条有效记忆
+1. diandian:GroupMessage:738458661 · 8 条 · 最近 2026-11-02 10:20
+2. diandian:FriendMessage:10001 · 3 条 · 最近 2026-11-02 09:12
+3. 未记录来源 · 1 条 · 最近 2026-10-28 18:04
+```
+
+老库升级不用做任何事：启动时 `PRAGMA table_info(mem)` 发现缺列就
+`ALTER TABLE mem ADD COLUMN origin TEXT NOT NULL DEFAULT ''`，已有记录归到「未记录来源」；
+迁移幂等，跑几次都一样，search / list 不受影响。
+
+管理页顶部多了「会话」下拉（数据来自 `GET /mem-api/sessions`），选中后列表按该会话过滤；
+详情抽屉里能看到「来源会话」，空值显示「未记录」。
 
 ## 从 LivingMemory 搬家
 
@@ -193,13 +228,15 @@ v0.6.0 起带一个管理页，不用记指令也能看库、改库。
 | 管理页接口 404 / 一片空白 | 插件是升级上来的、没重载（路由在 `initialize()` 里注册），在控制台点一次「重载」 |
 | 关系图只画了 300 个点 | 单页上限 300，用搜索或类型下拉缩小范围 |
 | 管理页没有「memory」标签 | 核心太老（没有 `astrbot.api.web` / 插件页面能力），指令功能不受影响 |
+| 升级后老记忆都显示「未记录来源」 | v0.7 及更早写入时没存 origin；升级后新写的才会带上 |
+| `/mem sessions` 只剩「未记录来源」 | 记忆都是 WebUI / 导入写的，没有事件上下文；用 `/mem add` 或聊天里让模型记一条就会分出来 |
 
 ## 开发
 
 实现与验收分开：改动由 tutu 开分支提交 PR，构建和自测由维护者在干净的 `instabox-friend-box` 上跑一遍原始输出才合并。自测全程离线——假 `astrbot.api` 模块桩 + 假 embedder / reranker，不打真实接口。
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 python3 selftest.py --offline   # 当前 435 条断言（v0.5.0 的 308 条 + v0.6.0 新增 127 条）
+PYTHONDONTWRITEBYTECODE=1 python3 selftest.py --offline   # 当前 497 条断言（v0.7.1 的 438 条 + v0.8.0 新增 59 条）
 ```
 
 

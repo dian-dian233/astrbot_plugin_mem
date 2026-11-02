@@ -39,6 +39,13 @@ v0.4.0 新增（从 LivingMemory 搬家 /mem import-lm）：
  28. epoch 浮点 ↔ ISO 字符串（也兼容本来就是 ISO 的列）
  29. --dry-run 不改库、--limit 截断、缺列表也能导入、只读句柄写不进去
  30. 自动探测顺序 + 递归深度上限 + 跳过 site-packages；找不到库不抛 traceback
+
+v0.8.0 新增（会话归属 origin）：
+ 31. 老库（无 origin 列）启动自动补列，老数据可读、search / list 正常，迁移幂等
+ 32. 四个写入通道：Store.add / `/mem add` / `memory_add` 带 umo；WebUI add 留空不伪造
+ 33. `/mem sessions [数量]` 聚合、排序、空 origin 归「未记录来源」、参数友好报错
+ 34. `GET /mem-api/sessions` + `/list?origin=` 精确过滤（可与 q 叠加）
+ 35. 导入不覆盖已有 origin：`/mem import` / `/mem import-lm` 同槽覆盖沿用旧 origin
 """
 
 from __future__ import annotations
@@ -357,7 +364,11 @@ class FakeEvent:
         self._sender = sender
         self._group = group
         self._admin = admin
-        self.unified_msg_origin = f"test:FriendMessage:{sender}"
+        # 对齐 astrbot/core/platform/astr_message_event.py:157 的 umo 格式
+        # `platform_name:message_type:session_id`；群里是 GroupMessage，私聊是 FriendMessage
+        self.unified_msg_origin = (
+            f"test:GroupMessage:{group}" if group else f"test:FriendMessage:{sender}"
+        )
 
     def plain_result(self, text):
         return ("plain", text)
@@ -1709,6 +1720,9 @@ def test_webapi_units(main_mod, chk: Checker) -> None:
     item = api.shape_item({})
     chk.eq((item["id"], item["mtype"], item["importance"], item["active"], item["value_preview"]),
            (0, "fact", 0.0, True, ""), "webapi：shape_item 空行给默认值（单条脏数据不炸）")
+    chk.eq(item["origin"], "", "webapi：shape_item 缺 origin 给空串")
+    item = api.shape_item({"id": 4, "origin": "diandian:GroupMessage:738458661"})
+    chk.eq(item["origin"], "diandian:GroupMessage:738458661", "webapi：shape_item 带 origin")
     item = api.shape_item({"id": 3, "subject": "s", "predicate": "p", "value": "x" * 80,
                            "mtype": "plan", "importance": 0.87, "valid_to": "2026-01-01"})
     chk.eq((item["id"], item["mtype"], item["importance"], item["active"]), (3, "plan", 0.87, False),
@@ -1771,10 +1785,11 @@ async def test_webapi_handlers(main_mod, tmp, chk: Checker) -> None:
     # 1) 注册：7 条路由，路径必须自带插件名（dashboard 就是这么匹配的）
     await h.plugin.initialize()
     apis = h.ctx.registered_web_apis
-    chk.eq(len(apis), 7, "webui：initialize 注册 7 个接口")
+    chk.eq(len(apis), 8, "webui：initialize 注册 8 个接口")
     routes = {api[0]: api for api in apis}
     chk.ok("webui：路由前缀带插件名", all(route.startswith(WEB_PREFIX) for route in routes), list(routes))
     chk.eq(routes[WEB_PREFIX + "list"][2], ["GET"], "webui：list 是 GET")
+    chk.eq(routes[WEB_PREFIX + "sessions"][2], ["GET"], "webui：sessions 是 GET")
     chk.eq(routes[WEB_PREFIX + "add"][2], ["POST"], "webui：add 是 POST")
     chk.eq(routes[WEB_PREFIX + "forget"][2], ["POST"], "webui：forget 是 POST")
     chk.eq(routes[WEB_PREFIX + "dedupe"][2], ["POST"], "webui：dedupe 是 POST")
@@ -1784,7 +1799,7 @@ async def test_webapi_handlers(main_mod, tmp, chk: Checker) -> None:
     chk.ok("webui：每个接口都有中文描述", all(bool(api[3]) for api in apis), "")
 
     await h.plugin.initialize()
-    chk.eq(len(h.ctx.registered_web_apis), 7, "webui：重复 initialize 不会重复注册（路由原位替换）")
+    chk.eq(len(h.ctx.registered_web_apis), 8, "webui：重复 initialize 不会重复注册（路由原位替换）")
 
     for subject, predicate, value in (
         ("点点", "喜欢喝", "冰美式"),
@@ -1981,6 +1996,14 @@ def test_webui_page(chk: Checker) -> None:
     chk.ok("前端：没有硬编码 http(s) 外部依赖", "http://" not in html and "https://" not in html, "")
     chk.ok("前端：零构建（没有 npm / import from）",
            "node_modules" not in html and 'type="module"' not in html, "")
+    # v0.8.0 会话归属
+    chk.ok("前端：工具栏有会话下拉 #fOrigin", 'id="fOrigin"' in html and "全部会话" in html, "")
+    chk.ok("前端：调用 /sessions 接口", 'ACT + "sessions"' in html, "")
+    chk.ok("前端：列表请求带 origin 参数", "origin: state.origin" in html, "")
+    chk.ok("前端：详情抽屉有「来源会话」且空值显示未记录",
+           "来源会话" in html and 'it.origin || "未记录"' in html, "")
+    chk.ok("前端：会话下拉限宽（不把 toolbar 撑成两行）",
+           ".field-session" in html and "max-width:186px" in html, "")
 
     scripts = _re.findall(r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", html, _re.S)
     chk.eq(len(scripts), 1, "前端：只有一个内联 <script>")
@@ -1998,6 +2021,239 @@ def test_webui_page(chk: Checker) -> None:
         fh.write(inline)
     proc = subprocess.run([node, "--check", tmp_js], capture_output=True, text=True)
     chk.ok("前端：node --check 语法通过", proc.returncode == 0, (proc.stderr or proc.stdout).strip()[:400])
+
+
+# ── v0.8.0：会话归属（origin） ─────────────────────────────────────────
+
+
+#: v0.7 及更早的 mem 表结构：有生命周期列，**没有 origin**
+OLD_MEM_SCHEMA_NO_ORIGIN = """
+CREATE TABLE mem(
+  id INTEGER PRIMARY KEY,
+  scope TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  predicate TEXT NOT NULL,
+  value TEXT NOT NULL,
+  confidence REAL DEFAULT 0.8,
+  source TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  valid_from TEXT NOT NULL,
+  valid_to TEXT,
+  superseded_by INTEGER,
+  mtype TEXT NOT NULL DEFAULT 'fact',
+  importance REAL NOT NULL DEFAULT 0.5,
+  ttl_days REAL NOT NULL DEFAULT 3650,
+  decay_type TEXT NOT NULL DEFAULT 'exp',
+  last_accessed_at TEXT,
+  access_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX ix_mem_slot ON mem(scope, subject, predicate, valid_to);
+"""
+
+
+def _mem_columns(db_path: str) -> set[str]:
+    conn = sqlite3.connect(db_path)
+    try:
+        return {row[1] for row in conn.execute("PRAGMA table_info(mem)")}
+    finally:
+        conn.close()
+
+
+async def test_origin_migration(main_mod, tmp, chk: Checker) -> None:
+    """老库没 origin 列：启动自动补列、数据能读能搜、跑两次幂等。"""
+    db = os.path.join(tmp, "mem_old_origin.db")
+    conn = sqlite3.connect(db)
+    conn.executescript(OLD_MEM_SCHEMA_NO_ORIGIN)
+    stamp = "2026-10-01T10:00:00+08:00"
+    conn.execute(
+        "INSERT INTO mem(scope,subject,predicate,value,created_at,updated_at,valid_from) "
+        "VALUES('global','老库','存着','迁移前写的事实',?,?,?)",
+        (stamp, stamp, stamp),
+    )
+    conn.commit()
+    conn.close()
+    chk.ok("v0.8：造出来的老库确实没有 origin 列", "origin" not in _mem_columns(db), "")
+
+    store = main_mod.Store(db)
+    chk.ok("v0.8：老库启动自动补 origin 列", "origin" in store.migrated_columns, store.migrated_columns)
+    chk.ok("v0.8：迁移后 PRAGMA 里真有 origin", "origin" in _mem_columns(db), "")
+    rows = store.active_rows()
+    chk.eq(len(rows), 1, "v0.8：迁移后老数据还在")
+    chk.eq(rows[0]["origin"], "", "v0.8：老记录 origin 补成空串（不是 NULL）")
+    chk.ok("v0.8：迁移后 keyword_search 正常",
+           [r["value"] for r in store.keyword_search(["迁移前"])] == ["迁移前写的事实"], "")
+
+    again = main_mod.Store(db)
+    chk.eq(again.migrated_columns, [], "v0.8：迁移幂等（第二次启动不再加列）")
+    chk.eq(again.stats()["active"], 1, "v0.8：迁移幂等后 stats 正常")
+    conn = sqlite3.connect(db)
+    origin_cols = [row[1] for row in conn.execute("PRAGMA table_info(mem)") if row[1] == "origin"]
+    conn.close()
+    chk.eq(origin_cols, ["origin"], "v0.8：重复迁移不会加出第二个 origin 列")
+
+    # 走插件真实检索路径：老库升级后 search / list 都不许炸
+    h = Harness(main_mod, tmp, db_name="mem_old_origin.db")
+    text = await h.cmd("mem search 迁移前")
+    chk.ok("v0.8：老库迁移后 /mem search 正常", "迁移前写的事实" in text, text)
+    text = await h.cmd("mem list")
+    chk.ok("v0.8：老库迁移后 /mem list 正常", "迁移前写的事实" in text, text)
+
+
+async def test_origin_write_paths(main_mod, tmp, chk: Checker) -> None:
+    """四个写入通道各自该带 / 不该带 origin。"""
+    h = Harness(main_mod, tmp, db_name="mem_origin_write.db")
+    h.plugin.name = "astrbot_plugin_mem"
+
+    result = h.store.add("global", "直接写", "来源", "store.add 带 origin", origin="p:GroupMessage:1")
+    chk.eq(h.store.get(result["id"])["origin"], "p:GroupMessage:1", "v0.8：Store.add(origin=) 落库能读回")
+    chk.eq(h.store.active_rows()[0]["origin"], "p:GroupMessage:1", "v0.8：active_rows 输出 origin")
+
+    text = await h.cmd("mem add 阿岚 住在 杭州", group="738458661")
+    row = [r for r in h.store.active_rows() if r["subject"] == "阿岚"][0]
+    chk.eq(row["origin"], "test:GroupMessage:738458661", "v0.8：/mem add 记录 event 的 umo")
+    chk.ok("v0.8：/mem add 回显格式没变", text.startswith("已记住 #"), text)
+
+    await h.plugin.memory_add(FakeEvent("", sender="10001"), "点点", "喜欢", "看星星")
+    row = [r for r in h.store.active_rows() if r["subject"] == "点点"][0]
+    chk.eq(row["origin"], "test:FriendMessage:10001", "v0.8：memory_add 工具记录 event 的 umo")
+
+    await h.plugin.initialize()
+    resp = await _call_web(h.plugin._web_add, body={"subject": "网页", "predicate": "来源", "value": "空"})
+    chk.eq(resp.payload["status"], "ok", "v0.8：WebUI add 仍成功")
+    chk.eq(resp.payload["data"]["item"]["origin"], "", "v0.8：WebUI /add 没有 event，origin 留空不伪造")
+    resp = await _call_web(h.plugin._web_list)
+    chk.ok("v0.8：/list 每行都带 origin 字段",
+           all("origin" in item for item in resp.payload["data"]["items"]), resp.payload["data"]["items"][:1])
+
+
+async def test_sessions_command(main_mod, tmp, chk: Checker) -> None:
+    """`/mem sessions [数量]`：聚合正确、空 origin 归组、参数友好报错。"""
+    h = Harness(main_mod, tmp, db_name="mem_sessions_cmd.db")
+    h.store.add("global", "甲", "喜欢", "A1", origin="diandian:GroupMessage:111")
+    h.store.add("global", "乙", "喜欢", "A2", origin="diandian:GroupMessage:111")
+    h.store.add("global", "丙", "喜欢", "B1", origin="diandian:FriendMessage:222")
+    h.store.add("global", "丁", "喜欢", "无来源")
+
+    text = await h.cmd("mem sessions")
+    chk.ok("v0.8：/mem sessions 汇总会话数与总条数", "3 个会话，共 4 条有效记忆" in text, text)
+    chk.ok("v0.8：/mem sessions 空 origin 归「未记录来源」", "未记录来源 · 1 条" in text, text)
+    lines = text.splitlines()
+    chk.ok("v0.8：/mem sessions 条数多的会话排第一",
+           "diandian:GroupMessage:111" in lines[1] and "2 条" in lines[1], lines[:3])
+
+    text2 = await h.cmd("mem sessions 2")
+    chk.ok("v0.8：/mem sessions [数量] 截断并提示", "显示前 2 个" in text2, text2)
+    chk.eq(len(text2.splitlines()), 3, "v0.8：截断后只输出 2 组明细（1 行表头 + 2 行）")
+
+    text3 = await h.cmd("mem sessions abc")
+    chk.ok("v0.8：/mem sessions 非数字参数友好报错（不是 traceback）",
+           "数量要是正整数" in text3 and "用法：/mem sessions" in text3, text3)
+
+    empty = Harness(main_mod, tmp, db_name="mem_sessions_empty.db")
+    chk.ok("v0.8：空库 /mem sessions 给引导文案",
+           "记忆库还是空的" in await empty.cmd("mem sessions"), "")
+
+
+async def test_web_sessions_and_filter(main_mod, tmp, chk: Checker) -> None:
+    """`GET /mem-api/sessions` + `/list?origin=` 过滤。"""
+    api = main_mod.web_api
+    built = api.build_sessions([
+        {"origin": "", "count": 1, "last_updated": "2026-10-01T00:00:00+08:00"},
+        {"origin": "p:GroupMessage:9", "count": 3, "last_updated": "2026-10-02T00:00:00+08:00"},
+    ])
+    chk.eq(built["items"][0]["origin"], "p:GroupMessage:9", "webapi：sessions 按条数降序")
+    chk.eq(built["items"][1]["label"], "未记录来源", "webapi：sessions 空 origin 给中文 label")
+    chk.eq((built["count"], built["total"]), (2, 4), "webapi：sessions 组数 / 总条数分开算")
+    chk.eq(api.build_sessions([])["items"], [], "webapi：sessions 空数据给空列表")
+
+    params = api.parse_list_query({"origin": "  p:GroupMessage:9  "})
+    chk.eq(params["origin"], "p:GroupMessage:9", "webapi：list origin 去首尾空格")
+    _expect_web_error(lambda: api.parse_list_query({"origin": "x" * 201}),
+                      "origin 太长了", "webapi：origin 超 200 字 → 400", chk)
+
+    h = Harness(main_mod, tmp, db_name="mem_web_origin.db")
+    h.plugin.name = "astrbot_plugin_mem"
+    await h.plugin.initialize()
+    h.store.add("global", "甲", "喜欢", "A1", origin="diandian:GroupMessage:111")
+    h.store.add("global", "乙", "喜欢", "A2", origin="diandian:GroupMessage:111")
+    h.store.add("global", "丙", "喜欢", "B1", origin="diandian:FriendMessage:222")
+    h.store.add("global", "丁", "喜欢", "无来源")
+
+    resp = await _call_web(h.plugin._web_sessions)
+    data = resp.payload["data"]
+    chk.eq((data["count"], data["total"]), (3, 4), "webui：/sessions 组数与总条数")
+    chk.eq(data["items"][0]["origin"], "diandian:GroupMessage:111", "webui：/sessions 条数多的在前")
+    chk.eq(data["items"][0]["count"], 2, "webui：/sessions 单组条数")
+    chk.ok("webui：/sessions 带 last_updated", bool(data["items"][0]["last_updated"]), data["items"][0])
+    chk.eq([it["label"] for it in data["items"]].count("未记录来源"), 1, "webui：/sessions 空 origin 合成一组")
+
+    resp = await _call_web(h.plugin._web_list, query={"origin": "diandian:GroupMessage:111"})
+    chk.eq(resp.payload["data"]["total"], 2, "webui：/list?origin= 只出该会话的记录")
+    chk.eq(resp.payload["data"]["origin"], "diandian:GroupMessage:111", "webui：/list 回显 origin")
+    resp = await _call_web(h.plugin._web_list, query={"origin": ""})
+    chk.eq(resp.payload["data"]["total"], 4, "webui：origin 为空串 = 全部")
+    resp = await _call_web(h.plugin._web_list, query={"origin": "不存在的会话"})
+    chk.eq(resp.payload["data"]["total"], 0, "webui：/list?origin= 无匹配给空页")
+    resp = await _call_web(h.plugin._web_list,
+                           query={"origin": "diandian:GroupMessage:111", "q": "A2"})
+    chk.eq(resp.payload["data"]["total"], 1, "webui：origin 与 q 可叠加过滤")
+
+
+async def test_import_keeps_origin(main_mod, tmp, chk: Checker) -> None:
+    """导入：新记录 origin 为空；同槽覆盖沿用旧 origin，绝不抹成空。"""
+    h = Harness(main_mod, tmp, db_name="mem_import_origin.db")
+    old = h.store.add(
+        "global", "搬家", "来源", "旧值",
+        origin="diandian:GroupMessage:777", created_at="2026-10-01T00:00:00+08:00",
+    )
+    payload = {
+        "items": [
+            # 文件里塞个 origin 也不认：导入没有会话上下文
+            {"scope": "global", "subject": "搬家", "predicate": "来源", "value": "新值",
+             "updated_at": "2026-10-05T00:00:00+08:00", "origin": "someone:Else:1"},
+            {"scope": "global", "subject": "新记录", "predicate": "来源", "value": "空",
+             "updated_at": "2026-10-05T00:00:00+08:00"},
+        ]
+    }
+    path = os.path.join(tmp, "import_origin.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False)
+
+    report = h.store.import_json(path)
+    chk.eq((report["added"], report["updated"]), (1, 1), "v0.8：导入统计（新增 1 / 覆盖 1）")
+    rows = {r["subject"]: r for r in h.store.active_rows()}
+    chk.eq(rows["搬家"]["origin"], "diandian:GroupMessage:777",
+           "v0.8：/mem import 同槽覆盖不抹掉已有 origin")
+    chk.eq(rows["新记录"]["origin"], "", "v0.8：/mem import 新记录 origin 为空")
+    conn = sqlite3.connect(h.store.path)
+    old_row = conn.execute("SELECT origin FROM mem WHERE id=?", (old["id"],)).fetchone()
+    conn.close()
+    chk.eq(old_row[0], "diandian:GroupMessage:777", "v0.8：被作废的历史行仍保留原 origin")
+
+    report2 = h.store.import_json(path)
+    chk.eq(report2["skipped"], 2, "v0.8：再导一次全部跳过")
+    rows = {r["subject"]: r for r in h.store.active_rows()}
+    chk.eq(rows["搬家"]["origin"], "diandian:GroupMessage:777", "v0.8：跳过的记录 origin 不变")
+
+    export_path = os.path.join(tmp, "export_origin.json")
+    h.store.export_json(export_path)
+    with open(export_path, encoding="utf-8") as fh:
+        exported = json.load(fh)
+    chk.ok("v0.8：导出 JSON 带 origin 字段",
+           all("origin" in item for item in exported["items"]), "")
+
+    # import-lm 走 import_records，同一条规则
+    h2 = Harness(main_mod, tmp, db_name="mem_import_lm_origin.db")
+    h2.store.add("global", "搬家甲", "来源", "旧值",
+                 origin="diandian:GroupMessage:888", created_at="2026-10-01T00:00:00+08:00")
+    res = h2.store.import_records([{
+        "scope": "global", "subject": "搬家甲", "predicate": "来源", "value": "新值",
+        "updated_at": "2026-10-05T00:00:00+08:00",
+    }])
+    chk.eq(res["updated"], 1, "v0.8：import-lm 同槽新者胜")
+    chk.eq(h2.store.active_rows()[0]["origin"], "diandian:GroupMessage:888",
+           "v0.8：/mem import-lm 同槽覆盖不抹掉已有 origin")
 
 
 # ── 入口 ───────────────────────────────────────────────────────────────
@@ -2059,6 +2315,12 @@ async def run_all() -> int:
         test_webapi_units(main_mod, chk)
         await test_webapi_handlers(main_mod, tmp_root, chk)
         test_webui_page(chk)
+        # v0.8.0：会话归属（origin）
+        await test_origin_migration(main_mod, tmp_root, chk)
+        await test_origin_write_paths(main_mod, tmp_root, chk)
+        await test_sessions_command(main_mod, tmp_root, chk)
+        await test_web_sessions_and_filter(main_mod, tmp_root, chk)
+        await test_import_keeps_origin(main_mod, tmp_root, chk)
     finally:
         shutil.rmtree(tmp_root, ignore_errors=True)
 

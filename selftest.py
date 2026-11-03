@@ -2000,6 +2000,15 @@ def test_webui_page(chk: Checker) -> None:
     chk.ok("前端：悬停提示截 60 字", "slice(0, 60)" in html, "")
     chk.ok("前端：关系图截断提示", "truncated" in html, "")
     chk.ok("前端：请求失败可见（#error 横幅）", 'id="error"' in html and "showError(" in html and 'role="alert"' in html, "")
+    # v0.9.0 应用外壳
+    chk.ok("v0.9：侧栏四个导航项", all(('data-view="%s"' % v) in html for v in ("graph", "list", "sessions", "settings")), "")
+    chk.ok("v0.9：四个视图容器", all(('id="%s"' % v) in html for v in ("vMain", "vSessions", "vSettings")), "")
+    chk.ok("v0.9：哈希路由", "location.hash" in html and "switchView" in html, "")
+    chk.ok("v0.9：顶栏全屏", 'id="btnFullscreen"' in html and "requestFullscreen" in html, "")
+    chk.ok("v0.9：底栏常驻搜索", 'id="q2"' in html, "")
+    chk.ok("v0.9：会话视图按 origin 聚合", "loadSessionsView" in html and "sessList" in html, "")
+    chk.ok("v0.9：设置视图只读", "loadSettingsView" in html and "settingsBox" in html, "")
+    chk.ok("v0.9：窄屏折叠侧栏", "max-width:860px" in html and "56px" in html, "")
     chk.ok("前端：没有硬编码 localhost / 127.0.0.1", "localhost" not in html and "127.0.0.1" not in html, "")
     chk.ok("前端：没有硬编码 http(s) 外部依赖", "http://" not in html and "https://" not in html, "")
     chk.ok("前端：零构建（没有 npm / import from）",

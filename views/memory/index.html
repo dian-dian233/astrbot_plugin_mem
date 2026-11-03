@@ -284,10 +284,77 @@
   @media (prefers-reduced-motion:reduce){
     *{transition:none!important;animation:none!important}
   }
+
+  /* ── 应用外壳 ── */
+  body{overflow:hidden}
+  .app{display:flex;height:100vh;height:100dvh}
+  .sidebar{width:200px;flex:0 0 200px;background:var(--surface);border-right:1px solid var(--line);
+    display:flex;flex-direction:column;padding:16px 0 10px}
+  .brand{padding:0 16px 14px;font-family:ui-serif,Georgia,"Songti SC",serif;font-size:15px;font-weight:600}
+  .brand span{display:block;font-size:11px;font-weight:400;color:var(--text-3);margin-top:3px}
+  .nav{display:flex;flex-direction:column;gap:1px;padding:0 8px}
+  .nav button{position:relative;display:flex;align-items:center;gap:9px;height:34px;padding:0 10px;
+    border:0;border-radius:var(--r-sm);background:transparent;color:var(--text-2);font:inherit;font-size:13px;
+    cursor:pointer;text-align:left;transition:background .12s,color .12s}
+  .nav button:hover{background:var(--hover);color:var(--text)}
+  .nav button[aria-current="true"]{background:var(--accent-soft);color:var(--text);font-weight:500}
+  .nav button[aria-current="true"]::before{content:"";position:absolute;left:-8px;top:8px;bottom:8px;width:2px;
+    background:var(--accent);border-radius:0 2px 2px 0}
+  .side-foot{margin-top:auto;padding:10px 16px 0;border-top:1px solid var(--line);font-size:11.5px;color:var(--text-3);line-height:1.6}
+  .main{flex:1;min-width:0;display:flex;flex-direction:column;overflow:hidden}
+  .topbar{display:flex;align-items:center;gap:10px;padding:11px 20px;border-bottom:1px solid var(--line);
+    background:var(--surface);flex-wrap:wrap}
+  .topbar h1{font-size:15px;font-weight:600;margin:0}
+  .topbar .grow{flex:1}
+  .stage{flex:1;overflow:auto;padding:16px 20px 0}
+  .view{display:none} .view.on{display:block}
+  .footer{display:flex;align-items:center;gap:12px;padding:9px 20px;border-top:1px solid var(--line);background:var(--surface)}
+  .footer .search{max-width:520px;flex:1}
+  .footer .hint{font-size:11.5px;color:var(--text-3);white-space:nowrap}
+  .sessions{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:10px}
+  .sess{text-align:left;background:var(--surface);border:1px solid var(--line);border-radius:var(--r-lg);
+    padding:13px 14px;cursor:pointer;transition:border-color .12s,background .12s}
+  .sess:hover{border-color:#D6D9DD;background:var(--surface-2)}
+  .sess .name{font-size:13px;font-weight:600;word-break:break-all}
+  .sess .meta{font-size:11.5px;color:var(--text-3);margin-top:3px}
+  .kv{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-lg);overflow:hidden}
+  .kv div{display:flex;gap:16px;padding:11px 16px;border-bottom:1px solid var(--line);font-size:12.5px}
+  .kv div:last-child{border-bottom:0}
+  .kv .k{flex:0 0 170px;color:var(--text-3)} .kv .v{color:var(--text);word-break:break-all}
+  .tabs{display:none}
+  @media (max-width:860px){
+    .sidebar{width:56px;flex-basis:56px;padding-top:12px}
+    .brand{padding:0 0 10px;text-align:center;font-size:11px} .brand span{display:none}
+    .nav button{justify-content:center;padding:0} .nav button .lbl{display:none}
+    .side-foot{display:none}
+  }
 </style>
 </head>
 <body>
-<div class="page">
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">全局记忆<span>Memory Workspace</span></div>
+    <nav class="nav">
+      <button data-view="graph" aria-current="true">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="6" cy="6" r="2.2"/><circle cx="18" cy="8" r="2.2"/><circle cx="12" cy="18" r="2.2"/><path d="M8 7l8 1M7 8l4 8M17 9l-4 7"/></svg>
+        <span class="lbl">知识图谱</span></button>
+      <button data-view="list">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 6h16M4 12h16M4 18h10"/></svg>
+        <span class="lbl">记忆管理</span></button>
+      <button data-view="sessions">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 6a2 2 0 0 1 2-2h9l5 5v9a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"/><path d="M14 4v6h6"/></svg>
+        <span class="lbl">会话</span></button>
+      <button data-view="settings">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/></svg>
+        <span class="lbl">设置</span></button>
+    </nav>
+    <div class="side-foot">记忆库 <b id="footCount">—</b> 条<br>跨会话共享</div>
+  </aside>
+  <div class="main">
+    <div class="topbar"><h1 id="viewTitle">知识图谱</h1><span class="grow"></span>
+      <button class="btn" id="btnFullscreen">全屏</button></div>
+    <div class="stage">
+  <div class="page" style="padding:0;max-width:none">
   <header class="head">
     <div>
       <h1>全局记忆</h1>
@@ -306,6 +373,7 @@
     </div>
   </header>
 
+  <div class="view on" id="vMain">
   <section class="overview">
     <div class="metrics">
       <div class="metric"><div class="k">记忆总数</div><div class="v" id="mTotal">—</div></div>
@@ -424,6 +492,26 @@
       </div>
     </div>
   </section>
+  </div>
+
+  <div class="view" id="vSessions">
+    <div class="sessions" id="sessList"></div>
+    <div class="empty" id="sessEmpty" hidden><div class="big">还没有会话归属</div>
+      <div class="hint">新版写入的记忆会记下来自哪个群或私聊</div></div>
+  </div>
+
+  <div class="view" id="vSettings"><div class="kv" id="settingsBox"></div></div>
+</div>
+
+    </div>
+    <div class="footer">
+      <div class="search">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+        <input id="q2" placeholder="搜索记忆，回车跳到记忆管理" autocomplete="off" />
+      </div>
+      <span class="hint" id="footHint">—</span>
+    </div>
+  </div>
 </div>
 
 <div class="scrim" id="scrim"></div>
@@ -1210,8 +1298,113 @@
   window.addEventListener("resize", function () { if (state.view === "graph") drawGraph(); });
 
   loadStats();
-  loadSessions();
+  if (typeof loadSessions === "function") { loadSessions(); }
   loadList();
+  /* ── 外壳：视图路由 ── */
+  var VIEW_TITLE = { graph: "知识图谱", list: "记忆管理", sessions: "会话", settings: "设置" };
+
+  async function loadSessionsView() {
+    try {
+      var d = await api(ACT + "sessions");
+      var items = (d && (d.items || d.sessions)) || [];
+      if (!items.length) {
+        $("sessList").innerHTML = "";
+        $("sessEmpty").hidden = false;
+        return;
+      }
+      $("sessEmpty").hidden = true;
+      $("sessList").innerHTML = items.map(function (s) {
+        var name = s.origin || s.scope || "未记录来源";
+        var cnt = s.count == null ? (s.total || 0) : s.count;
+        var last = s.last_updated || s.updated_at || "";
+        return '<button class="sess" data-origin="' + esc(s.origin || "") + '">' +
+          '<div class="name">' + esc(name) + "</div>" +
+          '<div class="meta">' + cnt + " 条" + (last ? " · 最近 " + relTime(last) : "") + "</div></button>";
+      }).join("");
+      Array.prototype.forEach.call($("sessList").querySelectorAll("[data-origin]"), function (b) {
+        b.onclick = function () {
+          var o = b.getAttribute("data-origin");
+          var sel = $("fOrigin");
+          if (sel) {
+            var found = false;
+            Array.prototype.forEach.call(sel.options, function (op) {
+              if (op.value === o) { found = true; }
+            });
+            if (!found) {
+              var op = document.createElement("option");
+              op.value = o; op.textContent = o || "未记录来源";
+              sel.appendChild(op);
+            }
+            sel.value = o;
+          }
+          state.origin = o; state.offset = 0;
+          switchView("list");
+          loadList();
+        };
+      });
+    } catch (e) { toast("会话加载失败：" + e.message, true); }
+  }
+
+  async function loadSettingsView() {
+    try {
+      var d = await api(ACT + "stats");
+      var p = d.provider || {};
+      var rows = [
+        ["记忆库路径", d.path || "（默认 data 目录 mem.db）"],
+        ["作用域 scope", d.scope || "global"],
+        ["记忆总数", String(d.total == null ? "—" : d.total)],
+        ["有效 / 已作废", (d.active == null ? "—" : d.active) + " / " + (d.history == null ? "—" : d.history)],
+        ["向量条数", String(d.vec_rows == null ? "—" : d.vec_rows)],
+        ["Embedding", (p.ok ? "可用" : "不可用") + (p.model ? "（" + p.model + "）" : "")],
+        ["最近更新", d.last_updated || "—"],
+      ];
+      $("settingsBox").innerHTML = rows.map(function (r) {
+        return '<div><div class="k">' + esc(r[0]) + '</div><div class="v">' + esc(r[1]) + "</div></div>";
+      }).join("");
+    } catch (e) { toast("设置读取失败：" + e.message, true); }
+  }
+
+  function switchView(name) {
+    if (!VIEW_TITLE[name]) name = "graph";
+    Array.prototype.forEach.call(document.querySelectorAll(".nav button"), function (b) {
+      b.setAttribute("aria-current", b.getAttribute("data-view") === name ? "true" : "false");
+    });
+    $("viewTitle").textContent = VIEW_TITLE[name];
+    $("vMain").classList.toggle("on", name === "list" || name === "graph");
+    $("vSessions").classList.toggle("on", name === "sessions");
+    $("vSettings").classList.toggle("on", name === "settings");
+    if (name === "list") { $("tabTable").click(); }
+    if (name === "graph") { $("tabGraph").click(); loadGraph(); }
+    if (name === "sessions") { loadSessionsView(); }
+    if (name === "settings") { loadSettingsView(); }
+    if (location.hash.slice(1) !== name) history.replaceState(null, "", "#" + name);
+  }
+
+  Array.prototype.forEach.call(document.querySelectorAll(".nav button"), function (b) {
+    b.onclick = function () { switchView(b.getAttribute("data-view")); };
+  });
+  window.addEventListener("hashchange", function () { switchView(location.hash.slice(1) || "graph"); });
+
+  $("btnFullscreen").onclick = function () {
+    var doc = document.documentElement;
+    if (!document.fullscreenElement) {
+      (doc.requestFullscreen ? doc.requestFullscreen() : Promise.reject()).catch(function () {
+        toast("这个环境不支持全屏", true);
+      });
+    } else if (document.exitFullscreen) { document.exitFullscreen(); }
+  };
+
+  $("q2").addEventListener("keydown", function (ev) {
+    if (ev.key !== "Enter") return;
+    var v = ev.target.value.trim();
+    $("q").value = v;
+    state.q = v; state.offset = 0;
+    switchView("list");
+    loadList();
+  });
+
+  switchView(location.hash.slice(1) || "graph");
+
 })();
 </script>
 </body>
